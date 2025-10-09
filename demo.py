@@ -130,29 +130,27 @@ def forward_video(rgbs, framerate, model, args):
 
 
     # try this... saving fmap as .npy
-    os.makedirs("feature_maps", exist_ok=True)
+# B, T, C, H, W = rgbs.shape (already defined)
+    rgbs_reshape = rgbs.view(B * T, C, H, W)  # reshape 5D -> 4D
     
     with torch.no_grad():
         fmaps = model.get_fmaps(
-            rgbs,    # input frames
-            B=B,     # batch size (probably 1)
-            T=T,     # number of frames
-            sw=None, # sliding window, same as forward_sliding default
+            rgbs_reshape,  # 4D input
+            B=B*T,         # batch size now B*T
+            T=1,           # process one frame per batch element
+            sw=None,
             is_training=False
         )
     
-    fmaps_np = fmaps.detach().cpu().numpy()
+    # reshape back to (B, T, C, Hf, Wf) for saving
+    C_f, Hf, Wf = fmaps.shape[1], fmaps.shape[2], fmaps.shape[3]
+    fmaps = fmaps.view(B, T, C_f, Hf, Wf)
     
-    if fmaps_np.ndim == 5:  # (B, T, C, H, W)
-        for t in range(T):
-            np.save(f"feature_maps/frame_{t:04d}.npy", fmaps_np[0, t])
-    elif fmaps_np.ndim == 4:  # (T, C, H, W)
-        for t in range(T):
-            np.save(f"feature_maps/frame_{t:04d}.npy", fmaps_np[t])
-    else:
-        print("Unexpected fmap shape:", fmaps_np.shape)
-    
-    print(f"Saved {T} feature maps to feature_maps/")
+    # save each frame
+    import os, numpy as np
+    os.makedirs("feature_maps", exist_ok=True)
+    for t in range(T):
+        np.save(f"feature_maps/frame_{t:04d}.npy", fmaps[0, t].cpu().numpy())
 
 
 
