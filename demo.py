@@ -113,114 +113,190 @@ def count_parameters(model):
     print('total params: %.2f M' % (total_params/1000000.0))
     return total_params
 
-def forward_video(rgbs, framerate, model, args):
-    import os, numpy as np, time, torch, PIL
-    from PIL import Image
 
-    B, T, C, H, W = rgbs.shape
+def forward_video(rgbs, framerate, model, args):
+    
+    B,T,C,H,W = rgbs.shape
     assert C == 3
     device = rgbs.device
-    assert(B == 1)
+    assert(B==1)
 
-    grid_xy = utils.basic.gridcloud2d(1, H, W, norm=False, device=device).float()
-    grid_xy = grid_xy.permute(0, 2, 1).reshape(1, 1, 2, H, W)
+    grid_xy = utils.basic.gridcloud2d(1, H, W, norm=False, device='cuda:0').float() # 1,H*W,2
+    grid_xy = grid_xy.permute(0,2,1).reshape(1,1,2,H,W) # 1,1,2,H,W
 
     torch.cuda.empty_cache()
     print('starting forward...')
     f_start_time = time.time()
 
-    os.makedirs("feature_maps", exist_ok=True)
-
-    with torch.no_grad():
-        # reshape B,T,C,H,W -> (B*T, C, H, W)
-        rgbs_reshape = rgbs.view(B * T, C, H, W)
-
-        # get feature maps (expects 4D input)
-        fmaps = model.get_fmaps(
-            rgbs_reshape,
-            B=B * T,
-            T=1,
-            sw=None,
-            is_training=False
-        )
-
-        # reshape back to (B, T, C, Hf, Wf)
-        if fmaps.ndim == 4:
-            C_f, Hf, Wf = fmaps.shape[1], fmaps.shape[2], fmaps.shape[3]
-            fmaps = fmaps.view(B, T, C_f, Hf, Wf)
-        else:
-            print(f"Unexpected feature map shape: {fmaps.shape}")
-
-        # save each frame's fmap as .npy
-        for t in range(T):
-            np.save(f"feature_maps/frame_{t:04d}.npy", fmaps[0, t].cpu().numpy())
-    print(f"Saved {T} feature maps to feature_maps/")
-
-    flows_e, visconf_maps_e, _, _ = model.forward_sliding(
-        rgbs[:, args.query_frame:], iters=args.inference_iters,
-        sw=None, is_training=False
-    )
-
-    traj_maps_e = flows_e.cuda() + grid_xy
+    flows_e, visconf_maps_e, _, _ = \
+        model.forward_sliding(rgbs[:, args.query_frame:], iters=args.inference_iters, sw=None, is_training=False)
+    traj_maps_e = flows_e.cuda() + grid_xy # B,Tf,2,H,W
     if args.query_frame > 0:
-        backward_flows_e, backward_visconf_maps_e, _, _ = model.forward_sliding(
-            rgbs[:, :args.query_frame+1].flip([1]),
-            iters=args.inference_iters, sw=None, is_training=False
-        )
-        backward_traj_maps_e = backward_flows_e.cuda() + grid_xy
-        backward_traj_maps_e = backward_traj_maps_e.flip([1])[:, :-1]
-        backward_visconf_maps_e = backward_visconf_maps_e.flip([1])[:, :-1]
-        traj_maps_e = torch.cat([backward_traj_maps_e, traj_maps_e], dim=1)
-        visconf_maps_e = torch.cat([backward_visconf_maps_e, visconf_maps_e], dim=1)
-
-    ftime = time.time() - f_start_time
-    print(f'finished forward; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
+        backward_flows_e, backward_visconf_maps_e, _, _ = \
+            model.forward_sliding(rgbs[:, :args.query_frame+1].flip([1]), iters=args.inference_iters, sw=None, is_training=False)
+        backward_traj_maps_e = backward_flows_e.cuda() + grid_xy # B,Tb,2,H,W, reversed
+        backward_traj_maps_e = backward_traj_maps_e.flip([1])[:, :-1] # flip time and drop the overlapped frame
+        backward_visconf_maps_e = backward_visconf_maps_e.flip([1])[:, :-1] # flip time and drop the overlapped frame
+        traj_maps_e = torch.cat([backward_traj_maps_e, traj_maps_e], dim=1) # B,T,2,H,W
+        visconf_maps_e = torch.cat([backward_visconf_maps_e, visconf_maps_e], dim=1) # B,T,2,H,W
+    ftime = time.time()-f_start_time
+    print('finished forward; %.2f seconds / %d frames; %d fps' % (ftime, T, round(T/ftime)))
     utils.basic.print_stats('traj_maps_e', traj_maps_e)
     utils.basic.print_stats('visconf_maps_e', visconf_maps_e)
 
-    # visualization
+    # subsample to make the vis more readable
     rate = args.rate
-    trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
-    visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
+    trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
+    visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
+
     xy0 = trajs_e[0,0].cpu().numpy()
     colors = utils.improc.get_2d_colors(xy0, H, W)
 
     fn = args.mp4_path.split('/')[-1].split('.')[0]
-    rgb_out_f = f'./pt_vis_{fn}_rate{rate}_q{args.query_frame}.mp4'
+    rgb_out_f = './pt_vis_%s_rate%d_q%d.mp4' % (fn, rate, args.query_frame)
     print('rgb_out_f', rgb_out_f)
-    temp_dir = f'temp_pt_vis_{fn}_rate{rate}_q{args.query_frame}'
+    temp_dir = 'temp_pt_vis_%s_rate%d_q%d' % (fn, rate, args.query_frame)
     utils.basic.mkdir(temp_dir)
+    vis = []
 
-    frames = draw_pts_gpu(
-        rgbs[0].to(device),
-        trajs_e[0],
-        visconfs_e[0,:,:,1] > args.conf_thr,
-        colors,
-        rate=rate,
-        bkg_opacity=args.bkg_opacity
-    )
+    frames = draw_pts_gpu(rgbs[0].to('cuda:0'), trajs_e[0], visconfs_e[0,:,:,1] > args.conf_thr,
+                          colors, rate=rate, bkg_opacity=args.bkg_opacity)
+    print('frames', frames.shape)
 
     if args.vstack:
-        frames_top = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        frames_top = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy() # T,H,W,3
         frames = np.concatenate([frames_top, frames], axis=1)
     elif args.hstack:
-        frames_left = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        frames_left = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy() # T,H,W,3
         frames = np.concatenate([frames_left, frames], axis=2)
-
+    
     print('writing frames to disk')
     f_start_time = time.time()
     for ti in range(T):
-        temp_out_f = f'{temp_dir}/{ti:03d}.jpg'
-        Image.fromarray(frames[ti]).save(temp_out_f)
-    ftime = time.time() - f_start_time
-    print(f'finished writing; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
-
+        temp_out_f = '%s/%03d.jpg' % (temp_dir, ti)
+        im = PIL.Image.fromarray(frames[ti])
+        im.save(temp_out_f)#, "PNG", subsampling=0, quality=80)
+    ftime = time.time()-f_start_time
+    print('finished writing; %.2f seconds / %d frames; %d fps' % (ftime, T, round(T/ftime)))
+        
     print('writing mp4')
-    os.system(
-        f'/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 '
-        f'-framerate {framerate} -pattern_type glob -i "./{temp_dir}/*.jpg" '
-        f'-c:v libx264 -crf 20 -pix_fmt yuv420p {rgb_out_f}'
-    )
+    os.system('/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 -framerate %d -pattern_type glob -i "./%s/*.jpg" -c:v libx264 -crf 20 -pix_fmt yuv420p %s' % (framerate, temp_dir, rgb_out_f))
+
+
+
+
+
+
+
+    #for saving fmap to .npy use this else, keep use the other one
+# def forward_video(rgbs, framerate, model, args):
+#     import os, numpy as np, time, torch, PIL
+#     from PIL import Image
+
+#     B, T, C, H, W = rgbs.shape
+#     assert C == 3
+#     device = rgbs.device
+#     assert(B == 1)
+
+#     grid_xy = utils.basic.gridcloud2d(1, H, W, norm=False, device=device).float()
+#     grid_xy = grid_xy.permute(0, 2, 1).reshape(1, 1, 2, H, W)
+
+#     torch.cuda.empty_cache()
+#     print('starting forward...')
+#     f_start_time = time.time()
+
+#     os.makedirs("feature_maps", exist_ok=True)
+
+#     with torch.no_grad():
+#         # reshape B,T,C,H,W -> (B*T, C, H, W)
+#         rgbs_reshape = rgbs.view(B * T, C, H, W)
+
+#         # get feature maps (expects 4D input)
+#         fmaps = model.get_fmaps(
+#             rgbs_reshape,
+#             B=B * T,
+#             T=1,
+#             sw=None,
+#             is_training=False
+#         )
+
+#         # reshape back to (B, T, C, Hf, Wf)
+#         if fmaps.ndim == 4:
+#             C_f, Hf, Wf = fmaps.shape[1], fmaps.shape[2], fmaps.shape[3]
+#             fmaps = fmaps.view(B, T, C_f, Hf, Wf)
+#         else:
+#             print(f"Unexpected feature map shape: {fmaps.shape}")
+
+#         # save each frame's fmap as .npy
+#         for t in range(T):
+#             np.save(f"feature_maps/frame_{t:04d}.npy", fmaps[0, t].cpu().numpy())
+#     print(f"Saved {T} feature maps to feature_maps/")
+
+#     flows_e, visconf_maps_e, _, _ = model.forward_sliding(
+#         rgbs[:, args.query_frame:], iters=args.inference_iters,
+#         sw=None, is_training=False
+#     )
+
+#     traj_maps_e = flows_e.cuda() + grid_xy
+#     if args.query_frame > 0:
+#         backward_flows_e, backward_visconf_maps_e, _, _ = model.forward_sliding(
+#             rgbs[:, :args.query_frame+1].flip([1]),
+#             iters=args.inference_iters, sw=None, is_training=False
+#         )
+#         backward_traj_maps_e = backward_flows_e.cuda() + grid_xy
+#         backward_traj_maps_e = backward_traj_maps_e.flip([1])[:, :-1]
+#         backward_visconf_maps_e = backward_visconf_maps_e.flip([1])[:, :-1]
+#         traj_maps_e = torch.cat([backward_traj_maps_e, traj_maps_e], dim=1)
+#         visconf_maps_e = torch.cat([backward_visconf_maps_e, visconf_maps_e], dim=1)
+
+#     ftime = time.time() - f_start_time
+#     print(f'finished forward; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
+#     utils.basic.print_stats('traj_maps_e', traj_maps_e)
+#     utils.basic.print_stats('visconf_maps_e', visconf_maps_e)
+
+#     # visualization
+#     rate = args.rate
+#     trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
+#     visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
+#     xy0 = trajs_e[0,0].cpu().numpy()
+#     colors = utils.improc.get_2d_colors(xy0, H, W)
+
+#     fn = args.mp4_path.split('/')[-1].split('.')[0]
+#     rgb_out_f = f'./pt_vis_{fn}_rate{rate}_q{args.query_frame}.mp4'
+#     print('rgb_out_f', rgb_out_f)
+#     temp_dir = f'temp_pt_vis_{fn}_rate{rate}_q{args.query_frame}'
+#     utils.basic.mkdir(temp_dir)
+
+#     frames = draw_pts_gpu(
+#         rgbs[0].to(device),
+#         trajs_e[0],
+#         visconfs_e[0,:,:,1] > args.conf_thr,
+#         colors,
+#         rate=rate,
+#         bkg_opacity=args.bkg_opacity
+#     )
+
+#     if args.vstack:
+#         frames_top = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+#         frames = np.concatenate([frames_top, frames], axis=1)
+#     elif args.hstack:
+#         frames_left = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+#         frames = np.concatenate([frames_left, frames], axis=2)
+
+#     print('writing frames to disk')
+#     f_start_time = time.time()
+#     for ti in range(T):
+#         temp_out_f = f'{temp_dir}/{ti:03d}.jpg'
+#         Image.fromarray(frames[ti]).save(temp_out_f)
+#     ftime = time.time() - f_start_time
+#     print(f'finished writing; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
+
+#     print('writing mp4')
+#     os.system(
+#         f'/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 '
+#         f'-framerate {framerate} -pattern_type glob -i "./{temp_dir}/*.jpg" '
+#         f'-c:v libx264 -crf 20 -pix_fmt yuv420p {rgb_out_f}'
+#     )
     # # flow vis
     # rgb_out_f = './flow_vis.mp4'
     # temp_dir = 'temp_flow_vis'
