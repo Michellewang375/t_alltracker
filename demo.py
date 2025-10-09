@@ -127,6 +127,28 @@ def forward_video(rgbs, framerate, model, args):
     print('starting forward...')
     f_start_time = time.time()
 
+
+
+    # try this... saving fmap as .npy
+    os.makedirs("feature_maps", exist_ok=True)
+
+    with torch.no_grad():
+        try:
+            fmaps = model.net.get_fmaps(rgbs)
+        except AttributeError:
+            fmaps = model.get_fmaps(rgbs)
+    fmaps_np = fmaps.detach().cpu().numpy()
+    B, T = fmaps_np.shape[0], fmaps_np.shape[1] if fmaps_np.ndim == 5 else (1, fmaps_np.shape[0])
+    for t in range(T):
+        frame_fmap = fmaps_np[0, t] if fmaps_np.ndim == 5 else fmaps_np[t]
+        np.save(f"feature_maps/frame_{t:04d}.npy", frame_fmap)
+    print(f"Saved {T} feature maps to feature_maps/")
+
+
+
+
+
+
     flows_e, visconf_maps_e, _, _ = \
         model.forward_sliding(rgbs[:, args.query_frame:], iters=args.inference_iters, sw=None, is_training=False)
     traj_maps_e = flows_e.cuda() + grid_xy # B,Tf,2,H,W
