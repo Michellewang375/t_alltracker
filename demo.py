@@ -131,18 +131,29 @@ def forward_video(rgbs, framerate, model, args):
 
     # try this... saving fmap as .npy
     os.makedirs("feature_maps", exist_ok=True)
-
+    
     with torch.no_grad():
-        try:
-            fmaps = model.net.get_fmaps(rgbs)
-        except AttributeError:
-            fmaps = model.get_fmaps(rgbs)
+        fmaps = model.get_fmaps(
+            rgbs,    # input frames
+            B=B,     # batch size (probably 1)
+            T=T,     # number of frames
+            sw=None, # sliding window, same as forward_sliding default
+            is_training=False
+        )
+    
     fmaps_np = fmaps.detach().cpu().numpy()
-    B, T = fmaps_np.shape[0], fmaps_np.shape[1] if fmaps_np.ndim == 5 else (1, fmaps_np.shape[0])
-    for t in range(T):
-        frame_fmap = fmaps_np[0, t] if fmaps_np.ndim == 5 else fmaps_np[t]
-        np.save(f"feature_maps/frame_{t:04d}.npy", frame_fmap)
+    
+    if fmaps_np.ndim == 5:  # (B, T, C, H, W)
+        for t in range(T):
+            np.save(f"feature_maps/frame_{t:04d}.npy", fmaps_np[0, t])
+    elif fmaps_np.ndim == 4:  # (T, C, H, W)
+        for t in range(T):
+            np.save(f"feature_maps/frame_{t:04d}.npy", fmaps_np[t])
+    else:
+        print("Unexpected fmap shape:", fmaps_np.shape)
+    
     print(f"Saved {T} feature maps to feature_maps/")
+
 
 
 
