@@ -8,7 +8,7 @@ def visualize_feature_map(np_path, output_dir):
     fmap = np.load(np_path)
     base_name = os.path.splitext(os.path.basename(np_path))[0]
     
-    # Handle 2D or 3D maps
+    # Handle 2D/3D maps
     if fmap.ndim == 2:
         plt.imshow(fmap, cmap='viridis')
         plt.colorbar()
@@ -44,7 +44,7 @@ def main():
         print(f"Processing {npy_file}...")
         visualize_feature_map(np_path, args.output_dir)
 
-    print(f"\n✅ Visualization complete. Images saved to: {args.output_dir}")
+    print(f"\nVisualization complete. Images saved to: {args.output_dir}")
 
 if __name__ == "__main__":
     main()
