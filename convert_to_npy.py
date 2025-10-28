@@ -16,9 +16,9 @@ def convert_images_to_npy(input_dir, output_dir):
         return
 
     for img_path in image_paths:
-        # Load image in grayscale
-        img = Image.open(img_path).convert('L')
-        img_array = np.array(img)
+        # Load image as RGB
+        img = Image.open(img_path).convert('RGB')
+        img_array = np.array(img)  # shape: (H, W, 3)
 
         # Create output filename
         base_name = os.path.splitext(os.path.basename(img_path))[0]
