@@ -313,7 +313,36 @@ def forward_video(rgbs, framerate, model, args):
     
     return None
 
-def run(model, args):
+
+def read_image_folder(folder_path, image_size=1024, max_frames=None):
+    import glob
+    import cv2
+    from PIL import Image
+    import torch
+    img_paths = sorted(glob.glob(folder_path + '/*.[jp][pn]g'))  # jpg/png
+    if max_frames:
+        img_paths = img_paths[:max_frames]
+    imgs = []
+    for path in img_paths:
+        img = np.array(Image.open(path).convert('RGB'))
+        imgs.append(img)
+    H, W = imgs[0].shape[:2]
+    scale = min(int(image_size)/H, int(image_size)/W)
+    H, W = int(H*scale), int(W*scale)
+    H, W = H//8*8, W//8*8
+    imgs_resized = [cv2.resize(img, (W,H), interpolation=cv2.INTER_LINEAR) for img in imgs]
+    rgbs = [torch.from_numpy(img).permute(2,0,1) for img in imgs_resized]
+    rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).float()  # 1,T,C,H,W
+    framerate = 24  # dummy, only used if you want to write mp4
+    return rgbs, framerate
+
+
+
+
+
+
+
+# def run(model, args):
     log_dir = './logs_demo'
     
     global_step = 0
@@ -345,7 +374,14 @@ def run(model, args):
         p.requires_grad = False
     model.eval()
 
-    rgbs, framerate = read_mp4(args.mp4_path)
+    # uncomment for vid: rgbs, framerate = read_mp4(args.mp4_path)
+    if hasattr(args, 'image_folder') and args.image_folder:
+        rgbs, framerate = read_image_folder(args.image_folder, image_size=args.image_size, max_frames=args.max_frames)
+    else:
+    # original video reading
+    # rgbs, framerate = read_mp4(args.mp4_path)
+        pass
+
     print('rgbs[0]', rgbs[0].shape)
     H,W = rgbs[0].shape[:2]
     
@@ -368,6 +404,66 @@ def run(model, args):
     
     return None
 
+def run(model, args):
+
+    log_dir = './logs_demo'
+    global_step = 0
+
+    # Load checkpoint or default weights
+    if args.ckpt_init:
+        _ = utils.saveload.load(
+            None,
+            args.ckpt_init,
+            model,
+            optimizer=None,
+            scheduler=None,
+            ignore_load=None,
+            strict=True,
+            verbose=False,
+            weights_only=False,
+        )
+        print('Loaded weights from', args.ckpt_init)
+    else:
+        if args.tiny:
+            url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker_tiny.pth"
+        else:
+            url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth"
+        state_dict = torch.hub.load_state_dict_from_url(url, map_location='cpu')
+        model.load_state_dict(state_dict['model'], strict=True)
+        print('Loaded weights from', url)
+
+    model.cuda()
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+    model.eval()
+
+    # --- Load input frames ---
+    if hasattr(args, 'image_folder') and args.image_folder:
+        rgbs, framerate = read_image_folder(
+            args.image_folder, image_size=args.image_size, max_frames=args.max_frames
+        )
+    else:
+        rgbs, framerate = read_mp4(args.mp4_path)
+        # Convert to torch tensor and permute
+        rgbs = [torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).permute(2,0,1) for f in rgbs]
+        rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).float()  # 1,T,C,H,W
+
+    # Move to GPU
+    rgbs = rgbs.cuda()
+    print('rgbs', rgbs.shape)  # Should be [1, T, 3, H, W]
+
+    with torch.no_grad():
+        metrics = forward_video(rgbs, framerate, model, args)
+
+    return None
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
     
@@ -385,6 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("--vstack", action='store_true', default=False) # whether to stack the input and output in the mp4
     parser.add_argument("--hstack", action='store_true', default=False) # whether to stack the input and output in the mp4
     parser.add_argument("--tiny", action='store_true', default=False) # whether to use the tiny model
+    parser.add_argument("--image_folder", type=str, default='')  # folder of images (comment for vid run)
     args = parser.parse_args()
 
     from nets.alltracker import Net;

@@ -1,34 +1,37 @@
 import os
-import cv2
-import numpy as np
 import argparse
+import numpy as np
+from PIL import Image
+import glob
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert images to .npy")
-    parser.add_argument("--input_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--grayscale", action="store_true")
+def convert_images_to_npy(input_dir, output_dir):
+    # Make sure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
 
-    args = parser.parse_args()
+    # Get all jpg images in the input directory
+    image_paths = sorted(glob.glob(os.path.join(input_dir, "*.jpg")))
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not image_paths:
+        print(f"No .jpg images found in {input_dir}")
+        return
 
-    for fname in sorted(os.listdir(args.input_dir)):
-        if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-            img_path = os.path.join(args.input_dir, fname)
-            if args.grayscale:
-                img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            else:
-                img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+    for img_path in image_paths:
+        # Load image in grayscale
+        img = Image.open(img_path).convert('L')
+        img_array = np.array(img)
 
-            npy_path = os.path.join(args.output_dir, os.path.splitext(fname)[0] + ".npy")
-            np.save(npy_path, img)
-            print(f"Saved {npy_path}")
+        # Create output filename
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        npy_path = os.path.join(output_dir, f"{base_name}.npy")
 
-    print(f"Converted {len(os.listdir(args.output_dir))} frames to .npy to {args.output_dir}/")
+        # Save as .npy
+        np.save(npy_path, img_array)
+        print(f"Saved {npy_path}")
 
 if __name__ == "__main__":
-    main()
-#run command:
-# python convert_to_npy.py --input_dir img_no_fmap --output_dir feature_maps
-    # if want grayscale version: python convert_to_npy.py --input_dir img_no_fmap --output_dir feature_maps --grayscale
+    parser = argparse.ArgumentParser(description="Convert JPG images to NPY arrays.")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory with input JPG images")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save NPY files")
+    args = parser.parse_args()
+
+    convert_images_to_npy(args.input_dir, args.output_dir)
