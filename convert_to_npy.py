@@ -1,179 +1,507 @@
-#!/usr/bin/env python3
-import os
-import shutil
-import glob
-from pathlib import Path
-import pickle
-
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
-from sklearn.decomposition import PCA
-from scipy import signal
-import matplotlib.pyplot as plt
+import cv2
+import argparse
+import utils.saveload
+import utils.basic
+import utils.improc
+import PIL.Image
+import numpy as np
+import os
+from prettytable import PrettyTable
+import time
 
-# -----------------------------
-# Config
-# -----------------------------
-PATCH_SIZE = 16
-IMAGE_SIZE = 768
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+def read_mp4(name_path):
+    vidcap = cv2.VideoCapture(name_path)
+    framerate = int(round(vidcap.get(cv2.CAP_PROP_FPS)))
+    print('framerate', framerate)
+    frames = []
+    while vidcap.isOpened():
+        ret, frame = vidcap.read()
+        if ret == False:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    vidcap.release()
+    return frames, framerate
 
-BASE_DIR = Path(__file__).parent
-IMAGES_DIR = BASE_DIR / "dino_img"
-LOCAL_DINOV3_DIR = BASE_DIR / "dinov3_local"
-CHECKPOINT_FILE = "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
-CHECKPOINT_PATH = BASE_DIR / CHECKPOINT_FILE
-PKL_FILE = BASE_DIR / "fg_classifier.pkl"
+def draw_pts_gpu(rgbs, trajs, visibs, colormap, rate=1, bkg_opacity=0.5):
+    device = rgbs.device
+    T, C, H, W = rgbs.shape
+    trajs = trajs.permute(1,0,2) # N,T,2
+    visibs = visibs.permute(1,0) # N,T
+    N = trajs.shape[0]
+    colors = torch.tensor(colormap, dtype=torch.float32, device=device)  # [N,3]
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def resize_transform(img: Image, image_size=IMAGE_SIZE, patch_size=PATCH_SIZE):
-    w, h = img.size
-    h_patches = int(image_size / patch_size)
-    w_patches = int((w * image_size) / (h * patch_size))
-    return TF.to_tensor(TF.resize(img, (h_patches * patch_size, w_patches * patch_size)))
+    rgbs = rgbs * bkg_opacity # darken, to see the point tracks better
+    
+    opacity = 1.0
+    if rate==1:
+        radius = 1
+        opacity = 0.9
+    elif rate==2:
+        radius = 1
+    elif rate== 4:
+        radius = 2
+    elif rate== 8:
+        radius = 4
+    else:
+        radius = 6
+    sharpness = 0.15 + 0.05 * np.log2(rate)
+    
+    D = radius * 2 + 1
+    y = torch.arange(D, device=device).float()[:, None] - radius
+    x = torch.arange(D, device=device).float()[None, :] - radius
+    dist2 = x**2 + y**2
+    icon = torch.clamp(1 - (dist2 - (radius**2) / 2.0) / (radius * 2 * sharpness), 0, 1)  # [D,D]
+    icon = icon.view(1, D, D)
+    dx = torch.arange(-radius, radius + 1, device=device)
+    dy = torch.arange(-radius, radius + 1, device=device)
+    disp_y, disp_x = torch.meshgrid(dy, dx, indexing="ij")  # [D,D]
+    for t in range(T):
+        mask = visibs[:, t]  # [N]
+        if mask.sum() == 0:
+            continue
+        xy = trajs[mask, t] + 0.5  # [N,2]
+        xy[:, 0] = xy[:, 0].clamp(0, W - 1)
+        xy[:, 1] = xy[:, 1].clamp(0, H - 1)
+        colors_now = colors[mask]  # [N,3]
+        N = xy.shape[0]
+        cx = xy[:, 0].long()  # [N]
+        cy = xy[:, 1].long()
+        x_grid = cx[:, None, None] + disp_x  # [N,D,D]
+        y_grid = cy[:, None, None] + disp_y  # [N,D,D]
+        valid = (x_grid >= 0) & (x_grid < W) & (y_grid >= 0) & (y_grid < H)
+        x_valid = x_grid[valid]  # [K]
+        y_valid = y_grid[valid]
+        icon_weights = icon.expand(N, D, D)[valid]  # [K]
+        colors_valid = colors_now[:, :, None, None].expand(N, 3, D, D).permute(1, 0, 2, 3)[
+            :, valid
+        ]  # [3, K]
+        idx_flat = (y_valid * W + x_valid).long()  # [K]
 
-def load_and_preprocess_images(images_dir: Path):
-    image_paths = sorted(
-        glob.glob(str(images_dir / "*.png")) +
-        glob.glob(str(images_dir / "*.jpg")) +
-        glob.glob(str(images_dir / "*.jpeg"))
+        accum = torch.zeros_like(rgbs[t])  # [3, H, W]
+        weight = torch.zeros(1, H * W, device=device)  # [1, H*W]
+        img_flat = accum.view(C, -1)  # [3, H*W]
+        weighted_colors = colors_valid * icon_weights  # [3, K]
+        img_flat.scatter_add_(1, idx_flat.unsqueeze(0).expand(C, -1), weighted_colors)
+        weight.scatter_add_(1, idx_flat.unsqueeze(0), icon_weights.unsqueeze(0))
+        weight = weight.view(1, H, W)
+
+        alpha = weight.clamp(0, 1) * opacity
+        accum = accum / (weight + 1e-6)  # [3, H, W]
+        rgbs[t] = rgbs[t] * (1 - alpha) + accum * alpha
+    rgbs = rgbs.clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy() # T,H,W,3
+    if bkg_opacity==0.0:
+        for t in range(T):
+            hsv_frame = cv2.cvtColor(rgbs[t], cv2.COLOR_RGB2HSV)
+            saturation_factor = 1.5
+            hsv_frame[..., 1] = np.clip(hsv_frame[..., 1] * saturation_factor, 0, 255)
+            rgbs[t] = cv2.cvtColor(hsv_frame, cv2.COLOR_HSV2RGB)
+    return rgbs
+
+def count_parameters(model):
+    table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        param = parameter.numel()
+        if param > 100000:
+            table.add_row([name, param])
+        total_params+=param
+    print(table)
+    print('total params: %.2f M' % (total_params/1000000.0))
+    return total_params
+
+
+# def forward_video(rgbs, framerate, model, args):
+    
+#     B,T,C,H,W = rgbs.shape
+#     assert C == 3
+#     device = rgbs.device
+#     assert(B==1)
+
+#     grid_xy = utils.basic.gridcloud2d(1, H, W, norm=False, device='cuda:0').float() # 1,H*W,2
+#     grid_xy = grid_xy.permute(0,2,1).reshape(1,1,2,H,W) # 1,1,2,H,W
+
+#     torch.cuda.empty_cache()
+#     print('starting forward...')
+#     f_start_time = time.time()
+
+#     flows_e, visconf_maps_e, _, _ = \
+#         model.forward_sliding(rgbs[:, args.query_frame:], iters=args.inference_iters, sw=None, is_training=False)
+#     traj_maps_e = flows_e.cuda() + grid_xy # B,Tf,2,H,W
+#     if args.query_frame > 0:
+#         backward_flows_e, backward_visconf_maps_e, _, _ = \
+#             model.forward_sliding(rgbs[:, :args.query_frame+1].flip([1]), iters=args.inference_iters, sw=None, is_training=False)
+#         backward_traj_maps_e = backward_flows_e.cuda() + grid_xy # B,Tb,2,H,W, reversed
+#         backward_traj_maps_e = backward_traj_maps_e.flip([1])[:, :-1] # flip time and drop the overlapped frame
+#         backward_visconf_maps_e = backward_visconf_maps_e.flip([1])[:, :-1] # flip time and drop the overlapped frame
+#         traj_maps_e = torch.cat([backward_traj_maps_e, traj_maps_e], dim=1) # B,T,2,H,W
+#         visconf_maps_e = torch.cat([backward_visconf_maps_e, visconf_maps_e], dim=1) # B,T,2,H,W
+#     ftime = time.time()-f_start_time
+#     print('finished forward; %.2f seconds / %d frames; %d fps' % (ftime, T, round(T/ftime)))
+#     utils.basic.print_stats('traj_maps_e', traj_maps_e)
+#     utils.basic.print_stats('visconf_maps_e', visconf_maps_e)
+
+#     # subsample to make the vis more readable
+#     rate = args.rate
+#     trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
+#     visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
+
+#     xy0 = trajs_e[0,0].cpu().numpy()
+#     colors = utils.improc.get_2d_colors(xy0, H, W)
+
+#     fn = args.mp4_path.split('/')[-1].split('.')[0]
+#     rgb_out_f = './pt_vis_%s_rate%d_q%d.mp4' % (fn, rate, args.query_frame)
+#     print('rgb_out_f', rgb_out_f)
+#     temp_dir = 'temp_pt_vis_%s_rate%d_q%d' % (fn, rate, args.query_frame)
+#     utils.basic.mkdir(temp_dir)
+#     vis = []
+
+#     frames = draw_pts_gpu(rgbs[0].to('cuda:0'), trajs_e[0], visconfs_e[0,:,:,1] > args.conf_thr,
+#                           colors, rate=rate, bkg_opacity=args.bkg_opacity)
+#     print('frames', frames.shape)
+
+#     if args.vstack:
+#         frames_top = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy() # T,H,W,3
+#         frames = np.concatenate([frames_top, frames], axis=1)
+#     elif args.hstack:
+#         frames_left = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy() # T,H,W,3
+#         frames = np.concatenate([frames_left, frames], axis=2)
+    
+#     print('writing frames to disk')
+#     f_start_time = time.time()
+#     for ti in range(T):
+#         temp_out_f = '%s/%03d.jpg' % (temp_dir, ti)
+#         im = PIL.Image.fromarray(frames[ti])
+#         im.save(temp_out_f)#, "PNG", subsampling=0, quality=80)
+#     ftime = time.time()-f_start_time
+#     print('finished writing; %.2f seconds / %d frames; %d fps' % (ftime, T, round(T/ftime)))
+        
+#     print('writing mp4')
+#     os.system('/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 -framerate %d -pattern_type glob -i "./%s/*.jpg" -c:v libx264 -crf 20 -pix_fmt yuv420p %s' % (framerate, temp_dir, rgb_out_f))
+
+
+
+
+
+
+
+# for saving fmap to .npy use this else, keep use the other one
+def forward_video(rgbs, framerate, model, args):
+    import os, numpy as np, time, torch, PIL
+    from PIL import Image
+
+    B, T, C, H, W = rgbs.shape
+    assert C == 3
+    device = rgbs.device
+    assert(B == 1)
+
+    grid_xy = utils.basic.gridcloud2d(1, H, W, norm=False, device=device).float()
+    grid_xy = grid_xy.permute(0, 2, 1).reshape(1, 1, 2, H, W)
+
+    torch.cuda.empty_cache()
+    print('starting forward...')
+    f_start_time = time.time()
+
+    os.makedirs("feature_maps", exist_ok=True)
+
+    with torch.no_grad():
+        # reshape B,T,C,H,W -> (B*T, C, H, W)
+        rgbs_reshape = rgbs.view(B * T, C, H, W)
+
+        # get feature maps (expects 4D input)
+        fmaps = model.get_fmaps(
+            rgbs_reshape,
+            B=B * T,
+            T=1,
+            sw=None,
+            is_training=False
+        )
+
+        # reshape back to (B, T, C, Hf, Wf)
+        if fmaps.ndim == 4:
+            C_f, Hf, Wf = fmaps.shape[1], fmaps.shape[2], fmaps.shape[3]
+            fmaps = fmaps.view(B, T, C_f, Hf, Wf)
+        else:
+            print(f"Unexpected feature map shape: {fmaps.shape}")
+
+        # save each frame's fmap as .npy (naming images)
+        for t in range(T):
+            np.save(f"feature_maps/frame_{t+40:04d}.npy", fmaps[0, t].cpu().numpy()) #+20 means start naming at 20 i.e. frame_0020.png
+    print(f"Saved {T} feature maps to feature_maps/")
+
+    flows_e, visconf_maps_e, _, _ = model.forward_sliding(
+        rgbs[:, args.query_frame:], iters=args.inference_iters,
+        sw=None, is_training=False
     )
-    if not image_paths:
-        raise FileNotFoundError(f"No images found in {images_dir}")
 
-    processed_images = []
-    for path in image_paths:
-        img = Image.open(path).convert("RGB")
-        img_resized = resize_transform(img)
-        img_resized_norm = TF.normalize(img_resized, mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        processed_images.append(img_resized_norm)
+    traj_maps_e = flows_e.cuda() + grid_xy
+    if args.query_frame > 0:
+        backward_flows_e, backward_visconf_maps_e, _, _ = model.forward_sliding(
+            rgbs[:, :args.query_frame+1].flip([1]),
+            iters=args.inference_iters, sw=None, is_training=False
+        )
+        backward_traj_maps_e = backward_flows_e.cuda() + grid_xy
+        backward_traj_maps_e = backward_traj_maps_e.flip([1])[:, :-1]
+        backward_visconf_maps_e = backward_visconf_maps_e.flip([1])[:, :-1]
+        traj_maps_e = torch.cat([backward_traj_maps_e, traj_maps_e], dim=1)
+        visconf_maps_e = torch.cat([backward_visconf_maps_e, visconf_maps_e], dim=1)
 
-    return torch.stack(processed_images)
+    ftime = time.time() - f_start_time
+    print(f'finished forward; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
+    utils.basic.print_stats('traj_maps_e', traj_maps_e)
+    utils.basic.print_stats('visconf_maps_e', visconf_maps_e)
 
-# -----------------------------
-# Ensure DINOv3 repo exists
-# -----------------------------
-if not LOCAL_DINOV3_DIR.exists():
-    raise FileNotFoundError(f"Local DINOv3 repo not found: {LOCAL_DINOV3_DIR}. "
-                            f"Clone it via: git clone https://github.com/facebookresearch/dinov3.git {LOCAL_DINOV3_DIR}")
+    # visualization
+    rate = args.rate
+    trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
+    visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B, T, 2, -1).permute(0,1,3,2)
+    xy0 = trajs_e[0,0].cpu().numpy()
+    colors = utils.improc.get_2d_colors(xy0, H, W)
 
-# -----------------------------
-# Ensure checkpoint exists in hub cache
-# -----------------------------
-hub_cache_dir = Path.home() / ".cache/torch/hub/checkpoints"
-hub_cache_dir.mkdir(parents=True, exist_ok=True)
-dest_path = hub_cache_dir / CHECKPOINT_FILE
-if not dest_path.exists():
-    shutil.copy2(CHECKPOINT_PATH, dest_path)
-    print(f"Copied checkpoint to hub cache: {dest_path}")
+    fn = args.mp4_path.split('/')[-1].split('.')[0]
+    rgb_out_f = f'./pt_vis_{fn}_rate{rate}_q{args.query_frame}.mp4'
+    print('rgb_out_f', rgb_out_f)
+    temp_dir = f'temp_pt_vis_{fn}_rate{rate}_q{args.query_frame}'
+    utils.basic.mkdir(temp_dir)
 
-# -----------------------------
-# Load DINOv3 model
-# -----------------------------
-MODEL_NAME = "dinov3_vits16"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print(f"Loading DINOv3 model '{MODEL_NAME}' from local repo...")
-model = torch.hub.load(
-    repo_or_dir=str(LOCAL_DINOV3_DIR),
-    model=MODEL_NAME,
-    source="local"
-)
-model.eval()
-model = model.to(device)
-print(f"Model loaded: {MODEL_NAME}, embed_dim={model.embed_dim}")
-
-# -----------------------------
-# Load foreground classifier
-# -----------------------------
-with open(PKL_FILE, 'rb') as f:
-    clf = pickle.load(f)
-
-# -----------------------------
-# Load images
-# -----------------------------
-images_tensor = load_and_preprocess_images(IMAGES_DIR)
-image_resized_norm = images_tensor[0].to(device)  # first image
-h_patches, w_patches = [int(d / PATCH_SIZE) for d in image_resized_norm.shape[1:]]
-
-# -----------------------------
-# Extract features
-# -----------------------------
-MODEL_TO_NUM_LAYERS = {
-    'dinov3_vits16': 12,
-    'dinov3_vitsp16': 12,
-    'dinov3_vitb16': 12,
-    'dinov3_vitl16': 24,
-    'dinov3_vithp14': 32,
-    'dinov3_vit7b14': 40,
-}
-n_layers = MODEL_TO_NUM_LAYERS[MODEL_NAME]
-
-with torch.inference_mode():
-    feats = model.get_intermediate_layers(
-        image_resized_norm.unsqueeze(0),
-        n=range(n_layers),
-        reshape=True,
-        norm=True
+    frames = draw_pts_gpu(
+        rgbs[0].to(device),
+        trajs_e[0],
+        visconfs_e[0,:,:,1] > args.conf_thr,
+        colors,
+        rate=rate,
+        bkg_opacity=args.bkg_opacity
     )
-    x = feats[-1].squeeze().detach().cpu()
-    dim = x.shape[0]
-    x = x.view(dim, -1).permute(1, 0)
 
-# -----------------------------
-# Compute foreground score
-# -----------------------------
-fg_score = clf.predict_proba(x)[:, 1].reshape(h_patches, w_patches)
-fg_score_mf = torch.from_numpy(signal.medfilt2d(fg_score, kernel_size=3))
+    if args.vstack:
+        frames_top = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        frames = np.concatenate([frames_top, frames], axis=1)
+    elif args.hstack:
+        frames_left = rgbs[0].clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        frames = np.concatenate([frames_left, frames], axis=2)
 
-# -----------------------------
-# Plot original image & foreground
-# -----------------------------
-first_image_path = sorted(
-    glob.glob(str(IMAGES_DIR / "*.png")) +
-    glob.glob(str(IMAGES_DIR / "*.jpg")) +
-    glob.glob(str(IMAGES_DIR / "*.jpeg"))
-)[0]
-image = Image.open(first_image_path).convert("RGB")
+#naming imgs
+    print('writing frames to disk')
+    f_start_time = time.time()
+    for ti in range(T):
+        temp_out_f = f'{temp_dir}/{ti+20:03d}.jpg' #naiming starts at 20 i.e. frames_0020.png
+        Image.fromarray(frames[ti]).save(temp_out_f)
+    ftime = time.time() - f_start_time
+    print(f'finished writing; {ftime:.2f}s / {T} frames; {round(T/ftime)} fps')
 
-plt.rcParams.update({
-    "xtick.labelsize": 5,
-    "ytick.labelsize": 5,
-    "axes.labelsize": 5,
-    "axes.titlesize": 4,
-})
+    print('writing mp4')
+    os.system(
+        f'/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 '
+        f'-framerate {framerate} -pattern_type glob -i "./{temp_dir}/*.jpg" '
+        f'-c:v libx264 -crf 20 -pix_fmt yuv420p {rgb_out_f}'
+    )
+    # flow vis
+    rgb_out_f = './flow_vis.mp4'
+    temp_dir = 'temp_flow_vis'
+    utils.basic.mkdir(temp_dir)
+    vis = []
+    for ti in range(T):
+        flow_vis = utils.improc.flow2color(flows_e[0:1,ti])
+        vis.append(flow_vis)
+    for ti in range(T):
+        temp_out_f = '%s/%03d.png' % (temp_dir, ti)
+        im = PIL.Image.fromarray(vis[ti][0].permute(1,2,0).cpu().numpy())
+        im.save(temp_out_f, "PNG", subsampling=0, quality=100)
+    os.system('/usr/bin/ffmpeg -y -hide_banner -loglevel error -f image2 -framerate 24 -pattern_type glob -i "./%s/*.png" -c:v libx264 -crf 1 -pix_fmt yuv420p %s' % (temp_dir, rgb_out_f))
+    
+    return None
 
-plt.figure(figsize=(4, 2), dpi=300)
-plt.subplot(1, 2, 1)
-plt.imshow(image)
-plt.axis('off')
-plt.title(f"Image, Size {image.size}")
 
-plt.subplot(1, 2, 2)
-plt.imshow(fg_score_mf)
-plt.title(f"Foreground Score, Size {tuple(fg_score_mf.shape)}")
-plt.colorbar()
-plt.axis('off')
-plt.show()
+def read_image_folder(folder_path, image_size=1024, max_frames=None):
+    import glob
+    import cv2
+    from PIL import Image
+    import torch
 
-# -----------------------------
-# PCA projection for foreground patches
-# -----------------------------
-foreground_selection = fg_score_mf.view(-1) > 0.5
-fg_patches = x[foreground_selection]
+    img_paths = sorted(glob.glob(folder_path + '/*.[jp][pn]g'))  # jpg/png
 
-pca = PCA(n_components=3, whiten=True)
-pca.fit(fg_patches)
-projected_image = torch.from_numpy(pca.transform(x.numpy())).view(h_patches, w_patches, 3)
+    # Only take images 11-20 (10:20)
+    img_paths = img_paths[20:30]
 
-projected_image = torch.nn.functional.sigmoid(projected_image.mul(2.0)).permute(2, 0, 1)
-projected_image *= (fg_score_mf.unsqueeze(0) > 0.5)
+    if max_frames:
+        img_paths = img_paths[:max_frames]
 
-plt.figure(dpi=300)
-plt.imshow(projected_image.permute(1, 2, 0))
-plt.axis('off')
-plt.show()
+    imgs = []
+    for path in img_paths:
+        img = np.array(Image.open(path).convert('RGB'))
+        imgs.append(img)
+
+    H, W = imgs[0].shape[:2]
+    scale = min(int(image_size)/H, int(image_size)/W)
+    H, W = int(H*scale), int(W*scale)
+    H, W = H//8*8, W//8*8
+
+    imgs_resized = [cv2.resize(img, (W,H), interpolation=cv2.INTER_LINEAR) for img in imgs]
+    rgbs = [torch.from_numpy(img).permute(2,0,1) for img in imgs_resized]
+    rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).float()  # 1,T,C,H,W
+    framerate = 24  # dummy, only used if you want to write mp4
+    return rgbs, framerate
+
+
+
+
+
+
+#for vid
+def run(model, args):
+    log_dir = './logs_demo'
+    
+    global_step = 0
+
+    if args.ckpt_init:
+        _ = utils.saveload.load(
+            None,
+            args.ckpt_init,
+            model,
+            optimizer=None,
+            scheduler=None,
+            ignore_load=None,
+            strict=True,
+            verbose=False,
+            weights_only=False,
+        )
+        print('loaded weights from', args.ckpt_init)
+    else:
+        if args.tiny:
+            url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker_tiny.pth"
+        else:
+            url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth"
+        state_dict = torch.hub.load_state_dict_from_url(url, map_location='cpu')
+        model.load_state_dict(state_dict['model'], strict=True)
+        print('loaded weights from', url)
+
+    model.cuda()
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+    model.eval()
+
+    # uncomment for vid: 
+    rgbs, framerate = read_mp4(args.mp4_path)
+    # if hasattr(args, 'image_folder') and args.image_folder:
+    #     rgbs, framerate = read_image_folder(args.image_folder, image_size=args.image_size, max_frames=args.max_frames)
+    # else:
+    # # original video reading
+    # # rgbs, framerate = read_mp4(args.mp4_path)
+    #     pass
+
+    print('rgbs[0]', rgbs[0].shape)
+    H,W = rgbs[0].shape[:2]
+    
+    # shorten & shrink the video, in case the gpu is small
+    if args.max_frames:
+        rgbs = rgbs[:args.max_frames]
+    scale = min(int(args.image_size)/H, int(args.image_size)/W)
+    H, W = int(H*scale), int(W*scale)
+    H, W = H//8 * 8, W//8 * 8 # make it divisible by 8
+    rgbs = [cv2.resize(rgb, dsize=(W, H), interpolation=cv2.INTER_LINEAR) for rgb in rgbs]
+    print('rgbs[0]', rgbs[0].shape)
+
+    # move to gpu
+    rgbs = [torch.from_numpy(rgb).permute(2,0,1) for rgb in rgbs]
+    rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).float() # 1,T,C,H,W
+    print('rgbs', rgbs.shape)
+    
+    with torch.no_grad():
+        metrics = forward_video(rgbs, framerate, model, args)
+    
+    return None
+
+
+# for img
+# def run(model, args):
+
+#     log_dir = './logs_demo'
+#     global_step = 0
+
+#     # Load checkpoint or default weights
+#     if args.ckpt_init:
+#         _ = utils.saveload.load(
+#             None,
+#             args.ckpt_init,
+#             model,
+#             optimizer=None,
+#             scheduler=None,
+#             ignore_load=None,
+#             strict=True,
+#             verbose=False,
+#             weights_only=False,
+#         )
+#         print('Loaded weights from', args.ckpt_init)
+#     else:
+#         if args.tiny:
+#             url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker_tiny.pth"
+#         else:
+#             url = "https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth"
+#         state_dict = torch.hub.load_state_dict_from_url(url, map_location='cpu')
+#         model.load_state_dict(state_dict['model'], strict=True)
+#         print('Loaded weights from', url)
+
+#     model.cuda()
+#     for n, p in model.named_parameters():
+#         p.requires_grad = False
+#     model.eval()
+
+#     # --- Load input frames ---
+#     if hasattr(args, 'image_folder') and args.image_folder:
+#         rgbs, framerate = read_image_folder(
+#             args.image_folder, image_size=args.image_size, max_frames=args.max_frames
+#         )
+#     else:
+#         rgbs, framerate = read_mp4(args.mp4_path)
+#         # Convert to torch tensor and permute
+#         rgbs = [torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).permute(2,0,1) for f in rgbs]
+#         rgbs = torch.stack(rgbs, dim=0).unsqueeze(0).float()  # 1,T,C,H,W
+
+#     # Move to GPU
+#     rgbs = rgbs.cuda()
+#     print('rgbs', rgbs.shape)  # Should be [1, T, 3, H, W]
+
+#     with torch.no_grad():
+#         metrics = forward_video(rgbs, framerate, model, args)
+
+#     return None
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    torch.set_grad_enabled(False)
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt_init", type=str, default='') # the ckpt we want (else default)
+    parser.add_argument("--mp4_path", type=str, default='./demo_video/monkey.mp4') # input video 
+    parser.add_argument("--query_frame", type=int, default=0) # which frame to track from
+    parser.add_argument("--image_size", type=int, default=1024) # max dimension of a video frame (upsample to this)
+    parser.add_argument("--max_frames", type=int, default=400) # trim the video to this length
+    parser.add_argument("--inference_iters", type=int, default=4) # number of inference steps per forward
+    parser.add_argument("--window_len", type=int, default=16) # model hyperparam
+    parser.add_argument("--rate", type=int, default=2) # vis hyp
+    parser.add_argument("--conf_thr", type=float, default=0.1) # vis hyp
+    parser.add_argument("--bkg_opacity", type=float, default=0.5) # vis hyp
+    parser.add_argument("--vstack", action='store_true', default=False) # whether to stack the input and output in the mp4
+    parser.add_argument("--hstack", action='store_true', default=False) # whether to stack the input and output in the mp4
+    parser.add_argument("--tiny", action='store_true', default=False) # whether to use the tiny model
+    parser.add_argument("--image_folder", type=str, default='')  # folder of images (comment for vid run)
+    args = parser.parse_args()
+
+    from nets.alltracker import Net;
+    if args.tiny:
+        model = Net(args.window_len, use_basicencoder=True, no_split=True)
+    else:
+        model = Net(args.window_len)
+    count_parameters(model)
+
+    run(model, args)
+    
