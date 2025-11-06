@@ -149,6 +149,25 @@ def forward_video(rgbs, framerate, model, args):
     trajs_e = traj_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
     visconfs_e = visconf_maps_e[:,:,:,::rate,::rate].reshape(B,T,2,-1).permute(0,1,3,2) # B,T,N,2
 
+
+    # masking
+    if hasattr(args, 'mask') and args.mask is not None:
+        # Mask tensor should already be B,H,W or H,W on GPU
+        mask_img = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+        mask_img = cv2.resize(mask_img, (W, H), interpolation=cv2.INTER_NEAREST)
+        mask_tensor = torch.from_numpy(mask_img > 0).cuda()  # H x W, boolean
+
+        # Use first frame to get trajectory indices
+        xy0 = trajs_e[0,0].cpu().numpy()  # N x 2
+        x_idx = np.clip(xy0[:,0].astype(int), 0, W-1)
+        y_idx = np.clip(xy0[:,1].astype(int), 0, H-1)
+        
+        inside_mask = mask_tensor[y_idx, x_idx].cpu().numpy()  # N boolean
+        trajs_e = trajs_e[:, :, inside_mask, :]
+        visconfs_e = visconfs_e[:, :, inside_mask]
+#------
+
+
     xy0 = trajs_e[0,0].cpu().numpy()
     colors = utils.improc.get_2d_colors(xy0, H, W)
 
@@ -463,6 +482,21 @@ def run(model, args):
     # Move to GPU
     rgbs = rgbs.cuda()
     print('rgbs', rgbs.shape)  # Should be [1, T, 3, H, W]
+    
+    #  Apply mask 
+    mask_resized = None
+    if args.mask is not None:
+        mask_img = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+        if mask_img is None:
+            raise FileNotFoundError(f"Cannot read mask at {args.mask}")
+        
+        B, T, C, H, W = rgbs.shape  # fix unpacking
+        mask_resized = cv2.resize(mask_img, (W, H), interpolation=cv2.INTER_NEAREST)
+        mask_resized = (mask_resized > 0).astype(np.uint8)
+        
+        mask_tensor = torch.from_numpy(mask_resized).unsqueeze(0).unsqueeze(0).float().cuda()  # 1,1,H,W
+        rgbs = rgbs * mask_tensor
+
 
     with torch.no_grad():
         metrics = forward_video(rgbs, framerate, model, args)
@@ -471,6 +505,13 @@ def run(model, args):
 
 
 
+def load_mask(mask_path, frame_shape):
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise FileNotFoundError(f"Cannot read mask file at {mask_path}")
+    if mask.shape != frame_shape[:2]:
+        mask = cv2.resize(mask, (frame_shape[1], frame_shape[0]), interpolation=cv2.INTER_NEAREST)
+    return (mask > 0).astype(np.uint8)  # binary mask
 
 
 
@@ -494,6 +535,8 @@ if __name__ == "__main__":
     parser.add_argument("--hstack", action='store_true', default=False) # whether to stack the input and output in the mp4
     parser.add_argument("--tiny", action='store_true', default=False) # whether to use the tiny model
     parser.add_argument("--image_folder", type=str, default='')  # folder of images (comment for vid run)
+    parser.add_argument("--mask", type=str, default=None) # add masking to images
+
     args = parser.parse_args()
 
     from nets.alltracker import Net;
