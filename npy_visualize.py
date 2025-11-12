@@ -1,3 +1,5 @@
+#visualize numpy images by turning them into .jpg/.png images
+
 import os
 import argparse
 import numpy as np
