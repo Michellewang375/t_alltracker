@@ -7,21 +7,29 @@ import torch
 from types import SimpleNamespace
 import sqlite3
 
-# Import alltracker
-from all_t_git.nets.alltracker import Net
-from all_t_git.demo import run, read_image_folder, forward_video
 
-# import db
-from Database.Db import COLMAPDatabase
 
 
 #---------------------------CONFIG------------------------------
-# Add all_t_git folder to Python path
 sys.path.append(os.path.abspath("./all_t_git"))
+# Import alltracker after path is set
+from all_t_git.nets.alltracker import Net
+from all_t_git.demo import run, read_image_folder, forward_video
+
+# Import database module
+from Database.Db import COLMAPDatabase
+
+
+
+
+#---------------------------DIRECTORIES-------------------------
 RAW_IMG_DIR = "test_sin"
 DB_PATH = "./Database/alltracker.db"
-VIS_OUT_DIR = "./Database"
+VIS_OUT_DIR = "./Database/vis"
 os.makedirs(VIS_OUT_DIR, exist_ok=True)
+
+
+
 
 #---------------------------ALLTRACKER-----------------------------
 # Run AllTracker on all frames in input_dir using the same API as demo.py
@@ -37,13 +45,13 @@ def run_alltracker(model, input_dir, args):
         return {}
 
     # Forward through AllTracker
-    print("[AllTracker] Running forward pass...")
+    print("[AllTracker] Running forward pass")
     with torch.no_grad():
         traj_maps, vis_maps, *_ = model.forward_sliding(
             rgbs, iters=args.inference_iters, window_len=args.window_len
         )
 
-    # Convert output to per-frame keypoints (rough)
+    # Convert output to per-frame keypoints
     results = {}
     num_frames = traj_maps.shape[1]  # T
     for t in range(num_frames):
@@ -57,64 +65,132 @@ def run_alltracker(model, input_dir, args):
     return results
 
 
+
+
+
+
 #---------------------------ORB TRACKING------------------------------
 #Use ORB to refine and track keypoints between consecutive frames.
-def orb_track(results, input_dir):
+def orb_track(results, input_dir, max_kp=5000):
     orb = cv2.ORB_create(nfeatures=1000)
     tracked_results = {}
-    
     filenames = sorted(list(results.keys()))
     prev_kps, prev_desc = None, None
-    prev_img = None
 
     for i, filename in enumerate(filenames):
         img_path = os.path.join(input_dir, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
+            print(f"[ORB Track] WARNING: Could not read {filename}, skipping")
             continue
-
+        print(f"[ORB Track] Processing {filename}")
         kps_all, desc_all = results[filename]
-        kps_all_cv2 = [cv2.KeyPoint(float(x), float(y), 1) for (x, y) in kps_all]
+        # Convert keypoints (x,y) to cv2.KeyPoint objects
+        kps_all_cv2 = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kps_all] if len(kps_all) > 0 else []
+        # SUBSAMPLE since theres too many matches, orb cant process all 
+        if len(kps_all_cv2) > max_kp:
+            idxs = np.linspace(0, len(kps_all_cv2) - 1, max_kp).astype(int)
+            kps_all_cv2 = [kps_all_cv2[idx] for idx in idxs]
+            print(f"[ORB Track] Subsampled keypoints to {max_kp} (from {len(idxs)})")
+        # Compute ORB descriptors (will return list of KeyPoints + descriptors or (None, None))
+        if len(kps_all_cv2) > 0:
+            kps_refined, desc_refined = orb.compute(img, kps_all_cv2)
+            if desc_refined is None:
+                # ensure we always store a 2D uint8 descriptor array (possibly empty)
+                desc_refined = np.zeros((0, 32), dtype=np.uint8)
+                kps_refined = []
+            else:
+                desc_refined = np.asarray(desc_refined, dtype=np.uint8)
+                if desc_refined.ndim == 1:
+                    desc_refined = desc_refined.reshape(1, -1)
+        else:
+            kps_refined, desc_refined = [], np.zeros((0, 32), dtype=np.uint8)
 
-        # compute ORB descriptors using AllTracker keypoints
-        kps_refined, desc_refined = orb.compute(img, kps_all_cv2)
-        if desc_refined is None:
-            desc_refined = np.zeros((len(kps_refined), 32), dtype=np.uint8)
+        # Debug info
+        #print(f"[ORB Track DEBUG] prev_desc: {None if prev_desc is None else (type(prev_desc), getattr(prev_desc,'shape',None), getattr(prev_desc,'dtype',None))}")
+        #print(f"[ORB Track DEBUG] desc_refined: {(type(desc_refined), desc_refined.shape, desc_refined.dtype)}")
 
-        # if previous frame exists, match to track
-        if prev_kps is not None and prev_desc is not None:
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            matches = bf.match(prev_desc, desc_refined)
-            matches = sorted(matches, key=lambda x: x.distance)
-            print(f"[ORB Track] {len(matches)} matches between frames {filenames[i-1]} and {filename}")
-
-        # update
-        tracked_results[filename] = (
-            np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32),
-            desc_refined
-        )
-        prev_kps, prev_desc, prev_img = kps_refined, desc_refined, img
-
+        # Match if both descriptor sets are non-empty 2D arrays
+        if (prev_desc is not None and isinstance(prev_desc, np.ndarray) and prev_desc.size > 0 and
+            isinstance(desc_refined, np.ndarray) and desc_refined.size > 0):
+            prev_desc = np.asarray(prev_desc, dtype=np.uint8)
+            desc_refined = np.asarray(desc_refined, dtype=np.uint8)
+            if prev_desc.ndim != 2 or desc_refined.ndim != 2:
+                print(f"[ORB Track] Unexpected descriptor ndim: prev {prev_desc.ndim}, cur {desc_refined.ndim}. Skipping matching.")
+            else:
+                try:
+                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                    matches = bf.match(prev_desc, desc_refined)
+                    matches = sorted(matches, key=lambda x: x.distance)
+                    print(f"[ORB Track] {len(matches)} matches between frames {filenames[i-1]} and {filename}")
+                except cv2.error as e:
+                    print(f"[ORB Track] OpenCV matcher error: {e}. Skipping matching for this pair.")
+        else:
+            print(f"[ORB Track] Skipping matching for frame {filename} (no descriptors)")
+        # Save results: convert KeyPoints to Nx2 float32 points; keep descriptors as ndarray Nx32 uint8
+        pts = (np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32)
+               if kps_refined else np.zeros((0, 2), dtype=np.float32))
+        tracked_results[filename] = (pts, desc_refined if isinstance(desc_refined, np.ndarray) else np.zeros((0, 32), dtype=np.uint8))
+        prev_kps, prev_desc = kps_refined, desc_refined
     return tracked_results
 
 
+
+
+
+
+
 #---------------------------SAVE TO DATABASE------------------------------
+#ORB keypoints to COLMAP-compatible format
+    # Nx2 ORB keypoints to Nx6 COLMAP format
+def to_colmap_keypoints(kps):
+    N = kps.shape[0]
+    if N == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    
+    colmap_kps = np.zeros((N, 6), dtype=np.float32)
+    colmap_kps[:, :2] = kps          # x, y
+    colmap_kps[:, 2:5] = [1, 0, 1]   # a, b, c 
+    colmap_kps[:, 5] = 1.0        
+    return colmap_kps
+
+
 #Store refined keypoints and descriptors in database.
 def save_to_database(db_path, results):
     db = COLMAPDatabase.connect(db_path)
-    db.clear_keypoints()
-    db.clear_descriptors()
-    db.create_tables() 
+    db.create_tables()  # Ensure tables exist
 
-    for i, (filename, (kps, desc)) in enumerate(results.items()):
-        image_id = i + 1
-        db.add_keypoints(image_id, kps)
-        db.add_descriptors(image_id, desc)
-        print(f"[DB] Added {filename} (ID {image_id})")
+    for i, (filename, (pts, desc)) in enumerate(results.items()):
+        # Add image or get existing ID
+        try:
+            db.add_image(name=filename, camera_id=1)
+            image_id = db.execute("SELECT image_id FROM images WHERE name=?", (filename,)).fetchone()[0]
+        except sqlite3.IntegrityError:
+            # Image already exists
+            image_id = db.execute("SELECT image_id FROM images WHERE name=?", (filename,)).fetchone()[0]
+            
+        # Convert keypoints to Nx6 COLMAP format
+        colmap_kps = to_colmap_keypoints(pts)
 
+        # Only add/update keypoints if non-empty
+        if colmap_kps.shape[0] > 0:
+            # Delete existing keypoints first to avoid UNIQUE constraint
+            db.execute("DELETE FROM keypoints WHERE image_id=?", (image_id,))
+            db.add_keypoints(image_id, colmap_kps)
+            print(f"[DB] Added {colmap_kps.shape[0]} keypoints for {filename}")
+            
+        # Only add/update descriptors if non-empty
+        if desc.shape[0] > 0:
+            db.execute("DELETE FROM descriptors WHERE image_id=?", (image_id,))
+            db.add_descriptors(image_id, desc.astype(np.uint8))
+            print(f"[DB] Added descriptors for {filename}")
     db.commit()
     db.close()
-    print("[DB] Successfully saved all features.")
+    print("[DB] Finished saving to database.")
+
+
+
+
 
 
 #---------------------------VISUALIZE DB------------------------------
@@ -139,10 +215,15 @@ def visualize_from_db(db_path, img_dir, out_dir):
     print("[VIS] Visualization done.")
 
 
+
+
+
+
+
 #---------------------------PIPLINE------------------------------
 # 0. Alltracker model
 def main():
-    print("Creating AllTracker model")
+    print("0. Creating AllTracker model")
     args = SimpleNamespace(
         ckpt_init="./checkpoints/alltracker.pth",
         image_folder=RAW_IMG_DIR,
@@ -251,24 +332,24 @@ def main():
     if args.ckpt_init:
         checkpoint = torch.load(args.ckpt_init, map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=True)
-        print(f"[MODEL] Loaded checkpoint from {args.ckpt_init}")
+        #print(f"[MODEL] Loaded checkpoint from {args.ckpt_init}")
     else:
         print("[MODEL] Using default weights")
 
 # 1. all tracker
-    print("Running AllTracker")
+    print("\n1. Running AllTracker")
     alltracker_results = run_alltracker(model, RAW_IMG_DIR, args)
 
 # 2. orb tracking
-    print("ORB tracking")
+    print("\n2. ORB tracking")
     orb_results = orb_track(alltracker_results, RAW_IMG_DIR)
 
 # 3. saving to db
-    print("Saving to database")
+    print("\n3. Saving to database")
     save_to_database(DB_PATH, orb_results)
 
 # 4. visulization
-    print("Visualizing from DB")
+    print("\n4. Visualizing from DB")
     visualize_from_db(DB_PATH, RAW_IMG_DIR, VIS_OUT_DIR)
 
 if __name__ == "__main__":
