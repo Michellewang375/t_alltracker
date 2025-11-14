@@ -154,38 +154,51 @@ def to_colmap_keypoints(kps):
     colmap_kps[:, 5] = 1.0        
     return colmap_kps
 
-
 #Store refined keypoints and descriptors in database.
 def save_to_database(db_path, results):
     db = COLMAPDatabase.connect(db_path)
-    db.create_tables()  # Ensure tables exist
+    db.create_tables()
 
     for i, (filename, (pts, desc)) in enumerate(results.items()):
-        # Add image or get existing ID
+
+        # Insert or fetch image entry
         try:
             db.add_image(name=filename, camera_id=1)
-            image_id = db.execute("SELECT image_id FROM images WHERE name=?", (filename,)).fetchone()[0]
+            image_id = db.execute(
+                "SELECT image_id FROM images WHERE name=?", (filename,)
+            ).fetchone()[0]
         except sqlite3.IntegrityError:
-            # Image already exists
-            image_id = db.execute("SELECT image_id FROM images WHERE name=?", (filename,)).fetchone()[0]
-            
-        # Convert keypoints to Nx6 COLMAP format
-        colmap_kps = to_colmap_keypoints(pts)
+            # Image exists already — retrieve existing ID
+            image_id = db.execute(
+                "SELECT image_id FROM images WHERE name=?", (filename,)
+            ).fetchone()[0]
 
-        # Only add/update keypoints if non-empty
+        #saving kepoyints
+        colmap_kps = to_colmap_keypoints(pts)
+        # Remove existing keypoints for this image
+        db.execute("DELETE FROM keypoints WHERE image_id=?", (image_id,))
         if colmap_kps.shape[0] > 0:
-            # Delete existing keypoints first to avoid UNIQUE constraint
-            db.execute("DELETE FROM keypoints WHERE image_id=?", (image_id,))
             db.add_keypoints(image_id, colmap_kps)
             print(f"[DB] Added {colmap_kps.shape[0]} keypoints for {filename}")
-            
-        # Only add/update descriptors if non-empty
+        else:
+            print(f"[DB] No keypoints for {filename}")
+
+        #Saving descirptors
+        # Remove existing descriptors
+        db.execute("DELETE FROM descriptors WHERE image_id=?", (image_id,))
+
         if desc.shape[0] > 0:
-            db.execute("DELETE FROM descriptors WHERE image_id=?", (image_id,))
             db.add_descriptors(image_id, desc.astype(np.uint8))
-            print(f"[DB] Added descriptors for {filename}")
+            #print(f"[DB] Added descriptors for {filename}, blob size: {len(array_to_blob(desc))}")
+        else:
+            print(f"[DB] No descriptors for {filename}") 
+    #run to see blob info   
+    # rows = db.execute("SELECT image_id, rows, cols, LENGTH(data) FROM descriptors").fetchall()
+    # print(rows)
+
     db.commit()
     db.close()
+
     print("[DB] Finished saving to database.")
 
 
@@ -217,6 +230,8 @@ def visualize_from_db(db_path, img_dir, out_dir):
 
 
 
+
+        
 
 
 
@@ -261,20 +276,20 @@ def main():
     );""".format(MAX_IMAGE_ID)
 
     CREATE_KEYPOINTS_TABLE = """CREATE TABLE IF NOT EXISTS keypoints (
-        image_id INTEGER PRIMARY KEY NOT NULL,
-        rows INTEGER NOT NULL,
-        cols INTEGER NOT NULL,
-        data BLOB,
-        FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE
-    );"""
+    image_id INTEGER NOT NULL UNIQUE,
+    rows INTEGER NOT NULL,
+    cols INTEGER NOT NULL,
+    data BLOB,
+    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE);
+    """
 
     CREATE_DESCRIPTORS_TABLE = """CREATE TABLE IF NOT EXISTS descriptors (
-        image_id INTEGER PRIMARY KEY NOT NULL,
-        rows INTEGER NOT NULL,
-        cols INTEGER NOT NULL,
-        data BLOB,
-        FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE
-    );"""
+    image_id INTEGER NOT NULL UNIQUE,
+    rows INTEGER NOT NULL,
+    cols INTEGER NOT NULL,
+    data BLOB,
+    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE);
+    """
 
     CREATE_MATCHES_TABLE = """CREATE TABLE IF NOT EXISTS matches (
         pair_id INTEGER PRIMARY KEY NOT NULL,

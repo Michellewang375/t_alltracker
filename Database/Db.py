@@ -59,7 +59,7 @@ CREATE_CAMERAS_TABLE = """CREATE TABLE IF NOT EXISTS cameras (
     prior_focal_length INTEGER NOT NULL)"""
 
 CREATE_DESCRIPTORS_TABLE = """CREATE TABLE IF NOT EXISTS descriptors (
-    image_id INTEGER PRIMARY KEY NOT NULL,
+    image_id INTEGER NOT NULL UNIQUE,
     rows INTEGER NOT NULL,
     cols INTEGER NOT NULL,
     data BLOB,
@@ -97,11 +97,12 @@ CREATE TABLE IF NOT EXISTS two_view_geometries (
 """
 
 CREATE_KEYPOINTS_TABLE = """CREATE TABLE IF NOT EXISTS keypoints (
-    image_id INTEGER PRIMARY KEY NOT NULL,
+    image_id INTEGER NOT NULL UNIQUE,
     rows INTEGER NOT NULL,
     cols INTEGER NOT NULL,
     data BLOB,
-    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE)
+    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE CASCADE
+)
 """
 
 CREATE_MATCHES_TABLE = """CREATE TABLE IF NOT EXISTS matches (
@@ -264,11 +265,19 @@ class COLMAPDatabase(sqlite3.Connection):
         self.keypoints[image_id] = keypoints
 
     def add_descriptors(self, image_id, descriptors):
-        descriptors = np.ascontiguousarray(descriptors, np.uint8)
+        if descriptors is None:
+            raise ValueError(f"Descriptors for image_id={image_id} is None")
+
+        descriptors = np.ascontiguousarray(descriptors)  # keep original dtype
+        rows, cols = descriptors.shape
+
+        blob = array_to_blob(descriptors)
+
         self.execute(
             "INSERT INTO descriptors VALUES (?, ?, ?, ?)",
-            (image_id,) + descriptors.shape + (array_to_blob(descriptors),),
+            (image_id, rows, cols, blob),
         )
+
 
     def add_matches(self, image_id1, image_id2, matches):
         assert len(matches.shape) == 2
@@ -644,10 +653,10 @@ class COLMAPDatabase(sqlite3.Connection):
         kp_array = np.load(kp_path)
         self.add_keypoints(image_id, kp_array)
 
-    def add_descriptors_npy(self, image_id, desc_path):
-        descriptors = np.load(desc_path)
-        self.save_image_descriptors_npy(image_id, descriptors)
-    
+    def add_descriptors_npy(self, image_id, path):
+        desc = np.load(path)
+        self.add_descriptors(image_id, desc)
+
     def save_image_descriptors_npy(self, image_id, descriptors):
         self.add_descriptors(image_id, descriptors)
         self.commit()
