@@ -202,7 +202,6 @@ class COLMAPDatabase(sqlite3.Connection):
             self.matches = {}
             self.two_view_geom = {}
 
-
     def add_camera(
         self,
         model,
@@ -252,7 +251,7 @@ class COLMAPDatabase(sqlite3.Connection):
                 array_to_blob(position_covariance),
             ),
         )
-
+        
     def add_keypoints(self, image_id, keypoints):
         assert len(keypoints.shape) == 2
         assert keypoints.shape[1] in [2, 4, 6]
@@ -262,8 +261,8 @@ class COLMAPDatabase(sqlite3.Connection):
             "INSERT INTO keypoints VALUES (?, ?, ?, ?)",
             (image_id,) + keypoints.shape + (array_to_blob(keypoints),),
         )
-        self.keypoints[image_id] = keypoints
-
+        self.keypoints[image_id] = keypoints 
+    
     def add_descriptors(self, image_id, descriptors):
         if descriptors is None:
             raise ValueError(f"Descriptors for image_id={image_id} is None")
@@ -277,7 +276,6 @@ class COLMAPDatabase(sqlite3.Connection):
             "INSERT INTO descriptors VALUES (?, ?, ?, ?)",
             (image_id, rows, cols, blob),
         )
-
 
     def add_matches(self, image_id1, image_id2, matches):
         assert len(matches.shape) == 2
@@ -468,7 +466,7 @@ class COLMAPDatabase(sqlite3.Connection):
 
     def read_all_keypoints(self):
         keypoints = dict(
-            (image_id, blob_to_array(data, np.float32, (-1, self.feat_shape)))
+            (image_id, blob_to_array(data, np.float32, (-1, 6)))
             for image_id, data in self.execute("SELECT image_id, data FROM keypoints")
         )
         return keypoints

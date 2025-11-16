@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from types import SimpleNamespace
 import sqlite3
+#from Database.visualize import visualize_from_db
 
 
 
@@ -208,25 +209,33 @@ def save_to_database(db_path, results):
 
 #---------------------------VISUALIZE DB------------------------------
 def visualize_from_db(db_path, img_dir, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
     db = COLMAPDatabase.connect(db_path)
+    # Map image_id → filename
+    rows = db.execute("SELECT image_id, name FROM images").fetchall()
+    image_map = {row[0]: row[1] for row in rows}
     keypoints_dict = db.read_all_keypoints()
-
-    for image_id, keypoints in keypoints_dict.items():
-        img_name = f"{str(image_id).zfill(3)}.png"
-        img_path = os.path.join(img_dir, img_name)
-        if not os.path.exists(img_path):
+    for image_id, kps in keypoints_dict.items():
+        if kps is None or len(kps) == 0:
+            print(f"[VIS] No keypoints for image {image_id}")
             continue
-
+        filename = image_map[image_id]
+        img_path = os.path.join(img_dir, filename)
+        if not os.path.exists(img_path):
+            print(f"[VIS] Missing image: {img_path}")
+            continue
         img = cv2.imread(img_path)
-        for (x, y) in keypoints[:, :2]:
-            cv2.circle(img, (int(x), int(y)), 2, (0, 255, 0), -1)
-
-        cv2.imwrite(os.path.join(out_dir, f"vis_{img_name}"), img)
-        print(f"[VIS] Saved vis_{img_name}")
-
+        if img is None:
+            print(f"[VIS] Could not load {img_path}")
+            continue
+        vis = img.copy()
+        for x, y, *_ in kps:
+            cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
+        out_path = os.path.join(out_dir, f"vis_{filename}")
+        cv2.imwrite(out_path, vis)
+        print(f"[VIS] Saved {out_path}")
     db.close()
     print("[VIS] Visualization done.")
-
 
 
 
@@ -365,7 +374,12 @@ def main():
 
 # 4. visulization
     print("\n4. Visualizing from DB")
-    visualize_from_db(DB_PATH, RAW_IMG_DIR, VIS_OUT_DIR)
+    visualize_from_db(
+        db_path=DB_PATH,
+        img_dir=RAW_IMG_DIR,
+        out_dir=os.path.join(os.path.dirname(DB_PATH), "vis")
+    )
+
 
 if __name__ == "__main__":
     main()
