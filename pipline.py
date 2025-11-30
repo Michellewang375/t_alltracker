@@ -65,6 +65,16 @@ def run_alltracker(model, input_dir, args):
     print(f"[AllTracker] Extracted keypoints for {len(results)} frames.")
     return results
 
+def img_resize(img, image_size=1024): #same as alltracker read_image_folder
+    import cv2
+    H0, W0 = img.shape[:2]
+    scale = min(image_size / H0, image_size / W0)
+    H = int(H0 * scale)
+    W = int(W0 * scale)
+    H = (H // 8) * 8
+    W = (W // 8) * 8
+    img_resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+    return img_resized
 
 
 
@@ -84,6 +94,7 @@ def orb_track(results, input_dir, max_kp=5000):
         if img is None:
             print(f"[ORB Track] WARNING: Could not read {filename}, skipping")
             continue
+        img = img_resize(img)
         print(f"[ORB Track] Processing {filename}")
         kps_all, desc_all = results[filename]
         # Convert keypoints (x,y) to cv2.KeyPoint objects
@@ -208,18 +219,30 @@ def save_to_database(db_path, results):
 
 
 #---------------------------VISUALIZE DB------------------------------
-def visualize_from_db(db_path, img_dir, out_dir):
+def visualize_from_db(db_path, img_dir, out_dir, image_size=1024):
     os.makedirs(out_dir, exist_ok=True)
     db = COLMAPDatabase.connect(db_path)
     # Map image_id → filename
     rows = db.execute("SELECT image_id, name FROM images").fetchall()
     image_map = {row[0]: row[1] for row in rows}
     keypoints_dict = db.read_all_keypoints()
+    def preprocess_img(img):
+        H0, W0 = img.shape[:2]
+        scale = min(image_size / H0, image_size / W0)
+        H = int(H0 * scale)
+        W = int(W0 * scale)
+        H = (H // 8) * 8
+        W = (W // 8) * 8
+        return cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+    
     for image_id, kps in keypoints_dict.items():
         if kps is None or len(kps) == 0:
             print(f"[VIS] No keypoints for image {image_id}")
             continue
-        filename = image_map[image_id]
+        filename = image_map.get(image_id, None)
+        if filename is None:
+            print(f"[VIS] image_id {image_id} not found in images table")
+            continue
         img_path = os.path.join(img_dir, filename)
         if not os.path.exists(img_path):
             print(f"[VIS] Missing image: {img_path}")
@@ -228,8 +251,13 @@ def visualize_from_db(db_path, img_dir, out_dir):
         if img is None:
             print(f"[VIS] Could not load {img_path}")
             continue
-        vis = img.copy()
-        for x, y, *_ in kps:
+        # match size
+        img_resized = preprocess_img(img)
+        vis = img_resized.copy()
+        # handle dimenisonality
+        kps_2d = np.array(kps, dtype=np.float32)[:, :2]
+        # Draw keypoints
+        for x, y in kps_2d:
             cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
         out_path = os.path.join(out_dir, f"vis_{filename}")
         cv2.imwrite(out_path, vis)
@@ -238,9 +266,6 @@ def visualize_from_db(db_path, img_dir, out_dir):
     print("[VIS] Visualization done.")
 
 
-
-
-        
 
 
 
