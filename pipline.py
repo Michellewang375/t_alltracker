@@ -269,6 +269,66 @@ def visualize_from_db(db_path, img_dir, out_dir, image_size=1024):
 
 
 
+#---------------------------FEATURE CORRESPONDANCE------------------------------
+def f_matches(db_path, img_dir, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    db = COLMAPDatabase.connect(db_path)
+    # Map image_id → filename
+    rows = db.execute("SELECT image_id, name FROM images").fetchall()
+    image_map = {row[0]: row[1] for row in rows}
+    # reading keypoints and desc from db
+    keypoints_dict = db.read_all_keypoints()
+    desc_rows = db.execute("SELECT image_id, rows, cols, data FROM descriptors").fetchall()
+    desc_dict = {}
+    for image_id, r, c, blob in desc_rows:
+        arr = np.frombuffer(blob, dtype=np.uint8).reshape((r, c))
+        desc_dict[image_id] = arr
+    image_ids = sorted(keypoints_dict.keys())
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    for i in range(len(image_ids) - 1):
+        id1 = image_ids[i]
+        id2 = image_ids[i + 1]
+        kps1 = keypoints_dict[id1]
+        kps2 = keypoints_dict[id2]
+        desc1 = desc_dict.get(id1)
+        desc2 = desc_dict.get(id2)
+        if kps1 is None or kps2 is None or desc1 is None or desc2 is None:
+            print(f"[MATCH] Missing features for {id1} or {id2}")
+            continue
+        # Load images
+        img1 = cv2.imread(os.path.join(img_dir, image_map[id1]))
+        img2 = cv2.imread(os.path.join(img_dir, image_map[id2]))
+        if img1 is None or img2 is None:
+            print(f"[MATCH] Could not load images for {id1}, {id2}")
+            continue
+        # keypoints to cv2.KeyPoint for visualization
+        cv2_kps1 = [cv2.KeyPoint(float(x), float(y), 8) for x, y, *_ in kps1]
+        cv2_kps2 = [cv2.KeyPoint(float(x), float(y), 8) for x, y, *_ in kps2]
+        # Match descriptors
+        matches = bf.match(desc1, desc2)
+        matches = sorted(matches, key=lambda m: m.distance)
+        # Draw matches
+        vis = cv2.drawMatches(
+            img1, cv2_kps1,
+            img2, cv2_kps2,
+            matches[:80], #drawing 80 for now
+            None,
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+        )
+        out_path = os.path.join(out_dir, f"match_{id1}_{id2}.jpg")
+        cv2.imwrite(out_path, vis)
+        print(f"[MATCH] Saved {out_path}")
+    db.close()
+    print("[MATCH] Feature correspondance visualization done.")
+
+
+
+
+
+
+
+
+
 #---------------------------PIPLINE------------------------------
 # 0. Alltracker model
 def main():
@@ -402,7 +462,15 @@ def main():
     visualize_from_db(
         db_path=DB_PATH,
         img_dir=RAW_IMG_DIR,
-        out_dir=os.path.join(os.path.dirname(DB_PATH), "vis")
+        out_dir=os.path.join(os.path.dirname(DB_PATH), "vis") #in directory named vis
+    )
+
+# 5. feature correspondance visualization
+    print("\n5. Visualizing feature correspondance")
+    f_matches(
+        db_path=DB_PATH,
+        img_dir=RAW_IMG_DIR,
+        out_dir=os.path.join(os.path.dirname(DB_PATH), "matches") #in directory named matches
     )
 
 
