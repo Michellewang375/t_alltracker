@@ -177,7 +177,7 @@ class COLMAPDatabase(sqlite3.Connection):
         self.create_keypoints_table = lambda: self.executescript(CREATE_KEYPOINTS_TABLE)
         self.create_matches_table = lambda: self.executescript(CREATE_MATCHES_TABLE)
         self.create_name_index = lambda: self.executescript(CREATE_NAME_INDEX)
-
+    
         # * added
         self.feat_shape = 6  # must be 2, 4, or 6 (default)
         self.ransac_opt = RANSACOptions(
@@ -658,6 +658,42 @@ class COLMAPDatabase(sqlite3.Connection):
     def save_image_descriptors_npy(self, image_id, descriptors):
         self.add_descriptors(image_id, descriptors)
         self.commit()
+
+
+    def load_keypoints(self, image_id):
+        cursor = self.cursor()
+        cursor.execute(
+            "SELECT rows, cols, data FROM keypoints WHERE image_id=?",
+            (image_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        r, c, blob = row
+        arr = blob_to_array(blob, np.float32)
+        arr = arr.reshape((r, c))
+        return arr
+
+    def load_matches(self, image_id1, image_id2):
+        pair_id = (int(image_id1) << 32) | int(image_id2)
+
+        row = self.fetchone(
+            "SELECT rows, cols, data FROM matches WHERE pair_id=?",
+            (pair_id,)
+        )
+        if row is None:
+            return None
+        
+        r, c, blob = row
+        arr = blob_to_array(blob, np.int32)
+        arr = arr.reshape((r, c))
+        return arr
+
+
+
+
+
+
 
 
 
