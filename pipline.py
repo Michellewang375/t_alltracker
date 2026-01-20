@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from types import SimpleNamespace
 import sqlite3
+import matplotlib.pyplot as plt
 #from Database.visualize import visualize_from_db
 
 
@@ -14,8 +15,8 @@ import sqlite3
 #---------------------------CONFIG------------------------------
 sys.path.append(os.path.abspath("./all_t_git"))
 # Import alltracker after path is set
-from all_t_git.nets.alltracker import Net
-from all_t_git.demo import run, read_image_folder, forward_video
+from nets.alltracker import Net
+from demo import run, read_image_folder, forward_video
 
 # Import database module
 from Database.Db import COLMAPDatabase
@@ -24,46 +25,112 @@ from Database.Db import COLMAPDatabase
 
 
 #---------------------------DIRECTORIES-------------------------
+# "./All_t/masked"
 RAW_IMG_DIR = "test_sin"
+NEW_IMG_DIR = "/Database/vis"
 DB_PATH = "./Database/alltracker.db"
 VIS_OUT_DIR = "./Database/vis"
 os.makedirs(VIS_OUT_DIR, exist_ok=True)
+MASK_PATH = "/mnt/data1/michelle/t_alltracker/All_t/undistorted_mask.bmp"
+
+
 
 
 
 
 #---------------------------ALLTRACKER-----------------------------
-# Run AllTracker on all frames in input_dir using the same API as demo.py
-#  Returns a dictionary of keypoints per frame (or trajectories)
+# def run_alltracker(model, input_dir, args):
+#     # Load images
+#     rgbs, framerate = read_image_folder(
+#         input_dir, image_size=args.image_size, max_frames=args.max_frames
+#     )
+
+#     if len(rgbs) == 0:
+#         print("[AllTracker] No images found in", input_dir)
+#         return {}
+
+#     # Forward through AllTracker
+#     print("[AllTracker] Running forward pass")
+#     with torch.no_grad():
+#         traj_maps, vis_maps, *_ = model.forward_sliding(
+#             rgbs, iters=args.inference_iters, window_len=args.window_len
+#         )
+
+#     # Convert output to per-frame keypoints
+#     results = {}
+#     num_frames = traj_maps.shape[1]  # T
+#     for t in range(num_frames):
+#         traj_frame = traj_maps[0, t].cpu().numpy()  # HxW
+#         yx = np.argwhere(traj_frame > 0)  # list of (y, x)
+#         keypoints = yx[:, ::-1]  # convert to (x, y)
+#         descriptors = np.ones((len(keypoints), 32), dtype=np.float32)  # placeholder
+#         results[f"frame_{t:04d}.png"] = (keypoints, descriptors)
+
+#     print(f"[AllTracker] Extracted keypoints for {len(results)} frames.")
+#     return results
+
 def run_alltracker(model, input_dir, args):
-    # Load images
     rgbs, framerate = read_image_folder(
         input_dir, image_size=args.image_size, max_frames=args.max_frames
     )
-
     if len(rgbs) == 0:
         print("[AllTracker] No images found in", input_dir)
-        return {}
-
-    # Forward through AllTracker
+        return {}, {}
+    # Move to GPU and eval
+    rgbs = rgbs.cuda()
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+    model.eval()
+    # Forward through AllTracker (same as demo)
     print("[AllTracker] Running forward pass")
     with torch.no_grad():
         traj_maps, vis_maps, *_ = model.forward_sliding(
             rgbs, iters=args.inference_iters, window_len=args.window_len
         )
-
-    # Convert output to per-frame keypoints
+    # Convert outputs
+    traj_maps = traj_maps[0].cpu().numpy()   # (T, 2, H, W)
+    vis_maps  = vis_maps[0].cpu().numpy()    # (T, 1, H, W)
+    T, _, H, W = traj_maps.shape
+    xs, ys = np.meshgrid(np.arange(W), np.arange(H))
+    base_pts = np.stack([xs.flatten(), ys.flatten()], axis=-1).astype(np.float32)  # (H*W, 2)
     results = {}
-    num_frames = traj_maps.shape[1]  # T
-    for t in range(num_frames):
-        traj_frame = traj_maps[0, t].cpu().numpy()  # HxW
-        yx = np.argwhere(traj_frame > 0)  # list of (y, x)
-        keypoints = yx[:, ::-1]  # convert to (x, y)
-        descriptors = np.ones((len(keypoints), 32), dtype=np.float32)  # placeholder
-        results[f"frame_{t:04d}.png"] = (keypoints, descriptors)
+    correspondences = {}
 
-    print(f"[AllTracker] Extracted keypoints for {len(results)} frames.")
-    return results
+    for t in range(T):
+        flow = traj_maps[t]        # (2, H, W)
+        conf = vis_maps[t, 0]      # (H, W)
+        mask = conf > args.conf_thr
+
+        # keypoints in frame t (x,y)
+        ft_xy = np.stack([xs[mask], ys[mask]], axis=1).astype(np.float32)
+
+        # corresponding coordinates
+        flow_x = flow[0]
+        flow_y = flow[1]
+        f0_xy = np.stack([
+            xs[mask] - flow_x[mask],
+            ys[mask] - flow_y[mask]
+        ], axis=1).astype(np.float32)
+
+        # indices into flattened base_pts
+        idx0 = np.flatnonzero(mask.flatten()).astype(np.uint32)
+        idxt = np.arange(len(ft_xy), dtype=np.uint32)
+
+        # Save keypoints (descriptors r empty)
+        fname = f"frame_{t:04d}.png"
+        results[fname] = (ft_xy, np.zeros((len(ft_xy), 32), dtype=np.uint8))
+
+        # Save correspondence
+        correspondences[t] = {
+            "idx0": idx0,
+            "idxt": idxt,
+            "f0_xy": f0_xy,
+            "ft_xy": ft_xy,
+            "mask": mask  # keep 2D
+        }
+    print(f"[AllTracker] finished.")
+    return results, correspondences
+
 
 def img_resize(img, image_size=1024): #same as alltracker read_image_folder
     import cv2
@@ -77,38 +144,62 @@ def img_resize(img, image_size=1024): #same as alltracker read_image_folder
     return img_resized
 
 
+def resize_like_alltracker(img, image_size=1024):
+    H0, W0 = img.shape[:2]
+    scale = min(image_size / H0, image_size / W0)
+    H = int(H0 * scale)
+    W = int(W0 * scale)
+    H = (H // 8) * 8
+    W = (W // 8) * 8
+    img_r = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+    return img_r, (H0, W0), (H, W)
 
+
+def undo_resize_pts(pts, orig_shape, resized_shape):
+    H0, W0 = orig_shape
+    Hr, Wr = resized_shape
+    sx = W0 / Wr
+    sy = H0 / Hr
+    pts = pts.copy()
+    pts[:, 0] *= sx
+    pts[:, 1] *= sy
+    return pts
 
 
 #---------------------------ORB TRACKING------------------------------
 #Use ORB to refine and track keypoints between consecutive frames.
-def orb_track(results, input_dir, max_kp=5000):
-    orb = cv2.ORB_create(nfeatures=1000)
+def orb_track(results, input_dir, max_kp=5000, image_size=1024):
+    import cv2
     tracked_results = {}
+    orb = cv2.ORB_create(nfeatures=max_kp)
     filenames = sorted(list(results.keys()))
-    prev_kps, prev_desc = None, None
-
     for i, filename in enumerate(filenames):
         img_path = os.path.join(input_dir, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            print(f"[ORB Track] WARNING: Could not read {filename}, skipping")
+            print(f"[ORB Track]: Could not read {filename}, skipping")
             continue
-        img = img_resize(img)
-        print(f"[ORB Track] Processing {filename}")
+        #resizing
+        H0, W0 = img.shape[:2]
+        scale = min(image_size / H0, image_size / W0)
+        H = int(H0 * scale)
+        W = int(W0 * scale)
+        H = (H // 8) * 8
+        W = (W // 8) * 8
+        img_r = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+        
         kps_all, desc_all = results[filename]
-        # Convert keypoints (x,y) to cv2.KeyPoint objects
-        kps_all_cv2 = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kps_all] if len(kps_all) > 0 else []
-        # SUBSAMPLE since theres too many matches, orb cant process all 
-        if len(kps_all_cv2) > max_kp:
-            idxs = np.linspace(0, len(kps_all_cv2) - 1, max_kp).astype(int)
-            kps_all_cv2 = [kps_all_cv2[idx] for idx in idxs]
-            print(f"[ORB Track] Subsampled keypoints to {max_kp} (from {len(idxs)})")
-        # Compute ORB descriptors (will return list of KeyPoints + descriptors or (None, None))
-        if len(kps_all_cv2) > 0:
-            kps_refined, desc_refined = orb.compute(img, kps_all_cv2)
+        kps_cv2 = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kps_all] if len(kps_all) > 0 else []
+
+        # Subsample if too many
+        if len(kps_cv2) > max_kp:
+            idxs = np.linspace(0, len(kps_cv2)-1, max_kp).astype(int)
+            kps_cv2 = [kps_cv2[idx] for idx in idxs]
+
+        #computing orb
+        if len(kps_cv2) > 0:
+            kps_refined, desc_refined = orb.compute(img_r, kps_cv2)
             if desc_refined is None:
-                # ensure we always store a 2D uint8 descriptor array (possibly empty)
                 desc_refined = np.zeros((0, 32), dtype=np.uint8)
                 kps_refined = []
             else:
@@ -117,112 +208,178 @@ def orb_track(results, input_dir, max_kp=5000):
                     desc_refined = desc_refined.reshape(1, -1)
         else:
             kps_refined, desc_refined = [], np.zeros((0, 32), dtype=np.uint8)
-
-        # Debug info
-        #print(f"[ORB Track DEBUG] prev_desc: {None if prev_desc is None else (type(prev_desc), getattr(prev_desc,'shape',None), getattr(prev_desc,'dtype',None))}")
-        #print(f"[ORB Track DEBUG] desc_refined: {(type(desc_refined), desc_refined.shape, desc_refined.dtype)}")
-
-        # Match if both descriptor sets are non-empty 2D arrays
-        if (prev_desc is not None and isinstance(prev_desc, np.ndarray) and prev_desc.size > 0 and
-            isinstance(desc_refined, np.ndarray) and desc_refined.size > 0):
-            prev_desc = np.asarray(prev_desc, dtype=np.uint8)
-            desc_refined = np.asarray(desc_refined, dtype=np.uint8)
-            if prev_desc.ndim != 2 or desc_refined.ndim != 2:
-                print(f"[ORB Track] Unexpected descriptor ndim: prev {prev_desc.ndim}, cur {desc_refined.ndim}. Skipping matching.")
-            else:
-                try:
-                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-                    matches = bf.match(prev_desc, desc_refined)
-                    matches = sorted(matches, key=lambda x: x.distance)
-                    print(f"[ORB Track] {len(matches)} matches between frames {filenames[i-1]} and {filename}")
-                except cv2.error as e:
-                    print(f"[ORB Track] OpenCV matcher error: {e}. Skipping matching for this pair.")
+        #resizing
+        if kps_refined:
+            pts_orig = np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32)
+            sx = W0 / W
+            sy = H0 / H
+            pts_orig[:, 0] *= sx
+            pts_orig[:, 1] *= sy
         else:
-            print(f"[ORB Track] Skipping matching for frame {filename} (no descriptors)")
-        # Save results: convert KeyPoints to Nx2 float32 points; keep descriptors as ndarray Nx32 uint8
-        pts = (np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32)
-               if kps_refined else np.zeros((0, 2), dtype=np.float32))
-        tracked_results[filename] = (pts, desc_refined if isinstance(desc_refined, np.ndarray) else np.zeros((0, 32), dtype=np.uint8))
-        prev_kps, prev_desc = kps_refined, desc_refined
+            pts_orig = np.zeros((0, 2), dtype=np.float32)
+        tracked_results[filename] = (pts_orig, desc_refined)
     return tracked_results
 
 
+def apply_mask_to_keypoints(kps, mask):
+    if kps is None or len(kps) == 0:
+        return kps
+
+    H, W = mask.shape
+    inside = []
+    for x, y in kps:
+        ix, iy = int(round(x)), int(round(y))
+        if 0 <= ix < W and 0 <= iy < H and mask[iy, ix] > 0:
+            inside.append([x, y])
+    return np.array(inside, dtype=np.float32) if inside else np.zeros((0, 2), dtype=np.float32)
 
 
+def visualize_keypoints(img_path, kps, mask=None, out_path=None, show=False):
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"[WARN] Could not read {img_path}")
+        return
+
+    vis = img.copy()
+
+    # Draw keypoints
+    for x, y in kps:
+        cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
+
+    # Apply mask if available
+    if mask is not None:
+        mask_r = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        vis[mask_r == 0] = 0
+
+    # Save to file
+    if out_path is not None:
+        cv2.imwrite(out_path, vis)
+        print(f"[VIS] Saved masked keypoints to {out_path} ({len(kps)} points)")
+
+    # Show image
+    if show:
+        # Convert BGR -> RGB for matplotlib
+        plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        plt.axis('off')
+        plt.show()
+
+    return vis
 
 
+#---------------------------SAVE TO DB------------------------------
+# return Nx6 array for COLMAP
+def normalize_to_colmap_kp(pts):
+    if pts.shape[1] == 2:  
+        N = pts.shape[0]
+        scales = np.ones((N, 1), np.float32)
+        orientations = np.zeros((N, 1), np.float32)
+        a4 = np.zeros((N, 1), np.float32)
+        scores = np.ones((N, 1), np.float32)
+        return np.hstack([pts, scales, orientations, a4, scores]).astype(np.float32)
+    return pts.astype(np.float32)
 
-#---------------------------SAVE TO DATABASE------------------------------
-#ORB keypoints to COLMAP-compatible format
-    # Nx2 ORB keypoints to Nx6 COLMAP format
-def to_colmap_keypoints(kps):
-    N = kps.shape[0]
-    if N == 0:
-        return np.zeros((0, 6), dtype=np.float32)
+
+# filtering keypoints to demo the matching
+def filter_keypoints(pts, desc=None, max_kps=2000):
+    if pts is None or len(pts) == 0:
+        return pts, None, np.array([], dtype=np.int32)
+    N, C = pts.shape
+    if N <= max_kps:
+        return pts.astype(np.float32), desc, np.arange(N)
+    if C > 2:  # has scores
+        scores = pts[:, 2]
+        sel_idx = np.argsort(scores)[-max_kps:] # best ones
+    else:
+        sel_idx = np.random.choice(N, max_kps, replace=False)
+    pts_f = pts[sel_idx].astype(np.float32)
     
-    colmap_kps = np.zeros((N, 6), dtype=np.float32)
-    colmap_kps[:, :2] = kps          # x, y
-    colmap_kps[:, 2:5] = [1, 0, 1]   # a, b, c 
-    colmap_kps[:, 5] = 1.0        
-    return colmap_kps
+    # handling descr = none
+    if desc is not None and desc.shape[0] > 0:
+        desc_f = desc[sel_idx]
+    else:
+        desc_f = None
 
-#Store refined keypoints and descriptors in database.
-def save_to_database(db_path, results):
+    return pts_f, desc_f, sel_idx
+
+# saving to db
+def save_to_database(db_path, results_and_corr, max_kps=2000): # max keypoints
+    results, correspondences = results_and_corr
     db = COLMAPDatabase.connect(db_path)
     db.create_tables()
-
-    for i, (filename, (pts, desc)) in enumerate(results.items()):
-
-        # Insert or fetch image entry
+    image_id_map = {}
+    keypoints_map = {}  # for matching
+    
+    # Saving keypts
+    for filename, (pts, desc) in results.items():
+        # filter keypoints
+        pts_f, desc_f, sel_idx = filter_keypoints(pts, desc, max_kps=max_kps)
+        keypoints_map[filename] = sel_idx
+        # convert to COLMAP format
+        colmap_kps = normalize_to_colmap_kp(pts_f)
+        # create img
         try:
             db.add_image(name=filename, camera_id=1)
-            image_id = db.execute(
-                "SELECT image_id FROM images WHERE name=?", (filename,)
-            ).fetchone()[0]
         except sqlite3.IntegrityError:
-            # Image exists already — retrieve existing ID
-            image_id = db.execute(
-                "SELECT image_id FROM images WHERE name=?", (filename,)
-            ).fetchone()[0]
-
-        #saving kepoyints
-        colmap_kps = to_colmap_keypoints(pts)
-        # Remove existing keypoints for this image
+            pass
+        image_id = db.execute(
+            "SELECT image_id FROM images WHERE name=?", (filename,)
+        ).fetchone()[0]
+        image_id_map[filename] = image_id
+        # save keypoints
         db.execute("DELETE FROM keypoints WHERE image_id=?", (image_id,))
         if colmap_kps.shape[0] > 0:
             db.add_keypoints(image_id, colmap_kps)
             print(f"[DB] Added {colmap_kps.shape[0]} keypoints for {filename}")
         else:
             print(f"[DB] No keypoints for {filename}")
-
-        #Saving descirptors
-        # Remove existing descriptors
+        # save descriptors
         db.execute("DELETE FROM descriptors WHERE image_id=?", (image_id,))
+        if desc_f is not None and desc_f.shape[0] > 0:
+            db.add_descriptors(image_id, desc_f.astype(np.uint8))
 
-        if desc.shape[0] > 0:
-            db.add_descriptors(image_id, desc.astype(np.uint8))
-            #print(f"[DB] Added descriptors for {filename}, blob size: {len(array_to_blob(desc))}")
-        else:
-            print(f"[DB] No descriptors for {filename}") 
-    #run to see blob info   
-    # rows = db.execute("SELECT image_id, rows, cols, LENGTH(data) FROM descriptors").fetchall()
-    # print(rows)
+    # save matches (for fmap correspondance)
+    id0 = image_id_map.get("frame_0000.png", None)
+    sel0 = keypoints_map.get("frame_0000.png", None)
+    if id0 is None or sel0 is None:
+        print("[DB] ERROR: frame_0000.png missing")
+    else:
+        for t, corr in correspondences.items():
+            fname = f"frame_{t:04d}.png"
+            idt = image_id_map.get(fname, None)
+            selt = keypoints_map.get(fname, None)
+            if idt is None or selt is None:
+                continue
+            idx0, idxt = corr["idx0"].astype(np.uint32), corr["idxt"].astype(np.uint32)
+            # keep only matches with filtered keypoints
+            mask0 = np.isin(idx0, sel0)
+            maskt = np.isin(idxt, selt)
+            mask = mask0 & maskt
+            if not np.any(mask):
+                continue
+            # remap
+            idx_map0 = {old: new for new, old in enumerate(sel0)}
+            idx_mapt = {old: new for new, old in enumerate(selt)}
+            idx0_f = np.array([idx_map0[i] for i in idx0[mask]], dtype=np.uint32)
+            idxt_f = np.array([idx_mapt[i] for i in idxt[mask]], dtype=np.uint32)
 
+            match_arr = np.stack([idx0_f, idxt_f], axis=1)
+            pair_id = (id0 << 32) + idt
+            db.execute(
+                "INSERT OR REPLACE INTO matches(pair_id, rows, cols, data) VALUES (?,?,?,?)",
+                (pair_id, match_arr.shape[0], match_arr.shape[1], match_arr.tobytes())
+            )
+            print(f"[DB] Added {match_arr.shape[0]} matches 0 to {fname}")
     db.commit()
     db.close()
-
-    print("[DB] Finished saving to database.")
-
+    print("[DB] Finished saving keypoints + matches.")
 
 
 
-
-
-#---------------------------VISUALIZE DB------------------------------
+# ------------------VISUALIZE DB------------------
+# visualzing database by plotting out keypoints
 def visualize_from_db(db_path, img_dir, out_dir, image_size=1024):
     os.makedirs(out_dir, exist_ok=True)
     db = COLMAPDatabase.connect(db_path)
-    # Map image_id → filename
     rows = db.execute("SELECT image_id, name FROM images").fetchall()
     image_map = {row[0]: row[1] for row in rows}
     keypoints_dict = db.read_all_keypoints()
@@ -234,96 +391,101 @@ def visualize_from_db(db_path, img_dir, out_dir, image_size=1024):
         H = (H // 8) * 8
         W = (W // 8) * 8
         return cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
-    
     for image_id, kps in keypoints_dict.items():
         if kps is None or len(kps) == 0:
-            print(f"[VIS] No keypoints for image {image_id}")
             continue
         filename = image_map.get(image_id, None)
-        if filename is None:
-            print(f"[VIS] image_id {image_id} not found in images table")
-            continue
         img_path = os.path.join(img_dir, filename)
-        if not os.path.exists(img_path):
-            print(f"[VIS] Missing image: {img_path}")
-            continue
         img = cv2.imread(img_path)
         if img is None:
-            print(f"[VIS] Could not load {img_path}")
             continue
-        # match size
         img_resized = preprocess_img(img)
         vis = img_resized.copy()
-        # handle dimenisonality
         kps_2d = np.array(kps, dtype=np.float32)[:, :2]
-        # Draw keypoints
         for x, y in kps_2d:
             cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
         out_path = os.path.join(out_dir, f"vis_{filename}")
         cv2.imwrite(out_path, vis)
-        print(f"[VIS] Saved {out_path}")
     db.close()
-    print("[VIS] Visualization done.")
+    print("[VIS] Done.")
+
+
+def apply_mask_to_kps_and_matches(kps0, kps1, matches, mask):
+    H, W = mask.shape
+    def valid(pt):
+        x, y = int(pt[0]), int(pt[1])
+        return 0 <= x < W and 0 <= y < H and mask[y, x] > 0
+    keep = []
+    for i, (i0, i1) in enumerate(matches):
+        if valid(kps0[i0]) and valid(kps1[i1]):
+            keep.append(i)
+    if not keep:
+        return None, None, None
+    keep = np.array(keep)
+    return kps0, kps1, matches[keep]
 
 
 
 
 
 #---------------------------FEATURE CORRESPONDANCE------------------------------
-def f_matches(db_path, img_dir, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    db = COLMAPDatabase.connect(db_path)
-    # Map image_id → filename
-    rows = db.execute("SELECT image_id, name FROM images").fetchall()
-    image_map = {row[0]: row[1] for row in rows}
-    # reading keypoints and desc from db
-    keypoints_dict = db.read_all_keypoints()
-    desc_rows = db.execute("SELECT image_id, rows, cols, data FROM descriptors").fetchall()
-    desc_dict = {}
-    for image_id, r, c, blob in desc_rows:
-        arr = np.frombuffer(blob, dtype=np.uint8).reshape((r, c))
-        desc_dict[image_id] = arr
-    image_ids = sorted(keypoints_dict.keys())
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    for i in range(len(image_ids) - 1):
-        id1 = image_ids[i]
-        id2 = image_ids[i + 1]
-        kps1 = keypoints_dict[id1]
-        kps2 = keypoints_dict[id2]
-        desc1 = desc_dict.get(id1)
-        desc2 = desc_dict.get(id2)
-        if kps1 is None or kps2 is None or desc1 is None or desc2 is None:
-            print(f"[MATCH] Missing features for {id1} or {id2}")
-            continue
-        # Load images
-        img1 = cv2.imread(os.path.join(img_dir, image_map[id1]))
-        img2 = cv2.imread(os.path.join(img_dir, image_map[id2]))
-        if img1 is None or img2 is None:
-            print(f"[MATCH] Could not load images for {id1}, {id2}")
-            continue
-        # keypoints to cv2.KeyPoint for visualization
-        cv2_kps1 = [cv2.KeyPoint(float(x), float(y), 8) for x, y, *_ in kps1]
-        cv2_kps2 = [cv2.KeyPoint(float(x), float(y), 8) for x, y, *_ in kps2]
-        # Match descriptors
-        matches = bf.match(desc1, desc2)
-        matches = sorted(matches, key=lambda m: m.distance)
-        # Draw matches
-        vis = cv2.drawMatches(
-            img1, cv2_kps1,
-            img2, cv2_kps2,
-            matches[:80], #drawing 80 for now
-            None,
-            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+def f_matches(
+    img0_path,
+    img1_path,
+    kps0,
+    kps1,
+    matches,
+    mask=None,
+    max_vis=2000,
+    image_size=1024,
+    out_path="vis_matches.png"
+):
+    #loading imgs
+    img0 = cv2.imread(img0_path)
+    img1 = cv2.imread(img1_path)
+    img0_r, orig0, resized = resize_like_alltracker(img0, image_size)
+    img1_r, orig1, _ = resize_like_alltracker(img1, image_size)
+
+    #applying mask
+    if mask is not None:
+        # mask is 2D
+        if mask.ndim == 1:
+            raise ValueError("Mask must be 2D (H x W), got flattened array")
+        kps0, kps1, matches = apply_mask_to_kps_and_matches(
+            kps0, kps1, matches, mask
         )
-        out_path = os.path.join(out_dir, f"match_{id1}_{id2}.jpg")
-        cv2.imwrite(out_path, vis)
-        print(f"[MATCH] Saved {out_path}")
-    db.close()
-    print("[MATCH] Feature correspondance visualization done.")
+        if matches is None or len(matches) == 0:
+            print("[WARN] No matches left after masking")
+            return
 
+    if matches.shape[0] > max_vis:
+        idx = np.random.choice(matches.shape[0], max_vis, replace=False)
+        matches = matches[idx]
 
+    #resizing
+    kps0_draw = undo_resize_pts(kps0[:, :2], orig0, resized)
+    kps1_draw = undo_resize_pts(kps1[:, :2], orig1, resized)
 
-
+    #visualize
+    h = max(img0.shape[0], img1.shape[0])
+    w = img0.shape[1] + img1.shape[1]
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    canvas[:img0.shape[0], :img0.shape[1]] = img0
+    canvas[:img1.shape[0], img0.shape[1]:] = img1
+    for i0, i1 in matches:
+        x0, y0 = kps0_draw[i0]
+        x1, y1 = kps1_draw[i1]
+        x1 += img0.shape[1]
+        cv2.circle(canvas, (int(x0), int(y0)), 2, (0, 255, 0), -1)
+        cv2.circle(canvas, (int(x1), int(y1)), 2, (0, 255, 0), -1)
+        cv2.line(
+            canvas,
+            (int(x0), int(y0)),
+            (int(x1), int(y1)),
+            (255, 0, 0), 1
+        )
+    cv2.imwrite(out_path, canvas)
+    print(f"[VIS] Saved {out_path} ({len(matches)} matches)")
 
 
 
@@ -445,34 +607,67 @@ def main():
     else:
         print("[MODEL] Using default weights")
 
-# 1. all tracker
+ # -------------------RUN ALLTRACKER-------------------------
     print("\n1. Running AllTracker")
-    alltracker_results = run_alltracker(model, RAW_IMG_DIR, args)
+    alltracker_results_and_corr = run_alltracker(model, RAW_IMG_DIR, args)
 
-# 2. orb tracking
-    print("\n2. ORB tracking")
-    orb_results = orb_track(alltracker_results, RAW_IMG_DIR)
+# -------------------SAVE TO DATABASE-----------------------
+    print("\n2. Saving to database")
+    save_to_database(DB_PATH, alltracker_results_and_corr)
 
-# 3. saving to db
-    print("\n3. Saving to database")
-    save_to_database(DB_PATH, orb_results)
-
-# 4. visulization
-    print("\n4. Visualizing from DB")
-    visualize_from_db(
-        db_path=DB_PATH,
-        img_dir=RAW_IMG_DIR,
-        out_dir=os.path.join(os.path.dirname(DB_PATH), "vis") #in directory named vis
-    )
-
-# 5. feature correspondance visualization
-    print("\n5. Visualizing feature correspondance")
-    f_matches(
-        db_path=DB_PATH,
-        img_dir=RAW_IMG_DIR,
-        out_dir=os.path.join(os.path.dirname(DB_PATH), "matches") #in directory named matches
-    )
-
-
+# -------------------RUN ORB AND MASK-----------------------
+    print("\n3. ORB and masking")
+    orb_results = orb_track(alltracker_results_and_corr[0], RAW_IMG_DIR)
+    #loading mask
+    mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
+    if mask is not None:
+        mask = (mask > 0).astype(np.uint8)
+    else:
+        print("[WARN] Mask not found, skipping masking")
+    #visualize
+    vis_dir = os.path.join(os.path.dirname(DB_PATH), "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+    for fname, (kps, _) in orb_results.items():
+        out_path = os.path.join(vis_dir, f"vis_{fname}")
+        visualize_keypoints(
+            img_path=os.path.join(RAW_IMG_DIR, fname),
+            kps=kps,
+            mask=mask,
+            out_path=out_path,
+            show=True
+        )
+# -------------------VISUALIZE FEATURE MATCHES--------------
+    print("\n4. Visualizing feature correspondences")
+    results, correspondences = alltracker_results_and_corr
+    os.makedirs(os.path.join(os.path.dirname(DB_PATH), "matches"), exist_ok=True)
+    ref_name = "frame_0000.png"
+    kps0, _ = results[ref_name]
+    for t, corr in correspondences.items():
+        fname = f"frame_{t:04d}.png"
+        if fname not in results:
+            continue
+        kps1, _ = results[fname]
+        matches = np.stack(
+            [corr["idx0"], corr["idxt"]], axis=1
+        ).astype(np.int32)
+        mask = corr.get("mask", None)
+        # only visualize matches that exist after filtering
+        valid = (matches[:,0] < len(kps0)) & (matches[:,1] < len(kps1))
+        matches = matches[valid]
+        f_matches(
+            img0_path=os.path.join(RAW_IMG_DIR, ref_name),
+            img1_path=os.path.join(RAW_IMG_DIR, fname),
+            kps0=kps0,
+            kps1=kps1,
+            matches=matches,
+            mask=mask,         
+            max_vis=2000,            
+            out_path=os.path.join(
+                os.path.dirname(DB_PATH),
+                "matches",
+                f"matches_{fname}"
+            )
+        )
+    
 if __name__ == "__main__":
     main()
