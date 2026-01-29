@@ -27,10 +27,9 @@ from Database.Db import COLMAPDatabase
 #---------------------------DIRECTORIES-------------------------
 # "./All_t/masked"
 RAW_IMG_DIR = "test_sin"
-NEW_IMG_DIR = "/Database/vis"
+ALLT_IMG_DIR = "./All_t/masked"
 DB_PATH = "./Database/alltracker.db"
-VIS_OUT_DIR = "./Database/vis"
-os.makedirs(VIS_OUT_DIR, exist_ok=True)
+ORB_IMG_DIR = "./Database/vis"
 MASK_PATH = "/mnt/data1/michelle/t_alltracker/All_t/undistorted_mask.bmp"
 
 
@@ -437,59 +436,56 @@ def f_matches(
     matches,
     mask=None,
     max_vis=2000,
-    image_size=1024,
     out_path="vis_matches.png"
 ):
-    #loading imgs
+    # img loading
     img0 = cv2.imread(img0_path)
     img1 = cv2.imread(img1_path)
-    img0_r, orig0, resized = resize_like_alltracker(img0, image_size)
-    img1_r, orig1, _ = resize_like_alltracker(img1, image_size)
+    if img0 is None or img1 is None:
+        print(f"[WARN] Could not read {img0_path} or {img1_path}")
+        return
 
-    #applying mask
+    # masking
     if mask is not None:
-        # mask is 2D
-        if mask.ndim == 1:
-            raise ValueError("Mask must be 2D (H x W), got flattened array")
-        kps0, kps1, matches = apply_mask_to_kps_and_matches(
-            kps0, kps1, matches, mask
-        )
-        if matches is None or len(matches) == 0:
+        # masking size and match imgs same size
+        mask_r0 = cv2.resize(mask.astype(np.uint8), (img0.shape[1], img0.shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask_r1 = cv2.resize(mask.astype(np.uint8), (img1.shape[1], img1.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # both keypoints must be in mask
+        keep = [
+            i for i, (i0, i1) in enumerate(matches)
+            if mask_r0[int(kps0[i0][1]), int(kps0[i0][0])] > 0 and
+               mask_r1[int(kps1[i1][1]), int(kps1[i1][0])] > 0
+        ]
+        if len(keep) == 0:
             print("[WARN] No matches left after masking")
             return
+        matches = matches[keep]
 
+    # adjust how much to match here (max 2000)
     if matches.shape[0] > max_vis:
         idx = np.random.choice(matches.shape[0], max_vis, replace=False)
         matches = matches[idx]
 
-    #resizing
-    kps0_draw = undo_resize_pts(kps0[:, :2], orig0, resized)
-    kps1_draw = undo_resize_pts(kps1[:, :2], orig1, resized)
-
-    #visualize
+    # visualize
     h = max(img0.shape[0], img1.shape[0])
     w = img0.shape[1] + img1.shape[1]
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
     canvas[:img0.shape[0], :img0.shape[1]] = img0
     canvas[:img1.shape[0], img0.shape[1]:] = img1
     for i0, i1 in matches:
-        x0, y0 = kps0_draw[i0]
-        x1, y1 = kps1_draw[i1]
+        x0, y0 = kps0[i0]
+        x1, y1 = kps1[i1]
         x1 += img0.shape[1]
         cv2.circle(canvas, (int(x0), int(y0)), 2, (0, 255, 0), -1)
         cv2.circle(canvas, (int(x1), int(y1)), 2, (0, 255, 0), -1)
-        cv2.line(
-            canvas,
-            (int(x0), int(y0)),
-            (int(x1), int(y1)),
-            (255, 0, 0), 1
-        )
+        cv2.line(canvas, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 0), 1)
+
     cv2.imwrite(out_path, canvas)
-    print(f"[VIS] Saved {out_path} ({len(matches)} matches)")
+    print(f"[VIS] Saved {out_path}")
 
-
-
-
+    
+    
+    
 
 #---------------------------PIPLINE------------------------------
 # 0. Alltracker model
@@ -617,7 +613,7 @@ def main():
 
 # -------------------RUN ORB AND MASK-----------------------
     print("\n3. ORB and masking")
-    orb_results = orb_track(alltracker_results_and_corr[0], RAW_IMG_DIR)
+    orb_results = orb_track(alltracker_results_and_corr[0], ALLT_IMG_DIR)
     #loading mask
     mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
     if mask is not None:
@@ -630,44 +626,58 @@ def main():
     for fname, (kps, _) in orb_results.items():
         out_path = os.path.join(vis_dir, f"vis_{fname}")
         visualize_keypoints(
-            img_path=os.path.join(RAW_IMG_DIR, fname),
+            img_path=os.path.join(ALLT_IMG_DIR, fname),
             kps=kps,
             mask=mask,
             out_path=out_path,
             show=True
         )
+        
+        
 # -------------------VISUALIZE FEATURE MATCHES--------------
-    print("\n4. Visualizing feature correspondences")
+    print("\n4. Visualizing feature correspondences with masking")
     results, correspondences = alltracker_results_and_corr
-    os.makedirs(os.path.join(os.path.dirname(DB_PATH), "matches"), exist_ok=True)
-    ref_name = "frame_0000.png"
-    kps0, _ = results[ref_name]
-    for t, corr in correspondences.items():
-        fname = f"frame_{t:04d}.png"
-        if fname not in results:
+    matches_dir = os.path.join(os.path.dirname(DB_PATH), "matches")
+    os.makedirs(matches_dir, exist_ok=True)
+    # loading mask
+    mask = None
+    if MASK_PATH is not None and os.path.exists(MASK_PATH):
+        mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            mask = (mask > 0).astype(np.uint8)
+        else:
+            print("[WARN] Mask not found or invalid")
+    frame_names = sorted(results.keys())
+    for i in range(len(frame_names) - 1):
+        fname0 = frame_names[i]
+        fname1 = frame_names[i + 1]
+        kps0, _ = results[fname0]
+        kps1, _ = results[fname1]
+        # build matches
+        corr = correspondences.get(i+1, None)
+        if corr is None:
             continue
-        kps1, _ = results[fname]
-        matches = np.stack(
-            [corr["idx0"], corr["idxt"]], axis=1
-        ).astype(np.int32)
-        mask = corr.get("mask", None)
-        # only visualize matches that exist after filtering
+        matches = np.stack([corr["idx0"], corr["idxt"]], axis=1).astype(np.int32)
+        # only valid matches
         valid = (matches[:,0] < len(kps0)) & (matches[:,1] < len(kps1))
         matches = matches[valid]
+        
+        img0_path = os.path.join(ORB_IMG_DIR, f"vis_{fname0}")
+        img1_path = os.path.join(ORB_IMG_DIR, f"vis_{fname1}")
+        out_path = os.path.join(matches_dir, f"all_match_{i:04d}.png")
+
         f_matches(
-            img0_path=os.path.join(RAW_IMG_DIR, ref_name),
-            img1_path=os.path.join(RAW_IMG_DIR, fname),
+            img0_path=img0_path,
+            img1_path=img1_path,
             kps0=kps0,
             kps1=kps1,
             matches=matches,
-            mask=mask,         
-            max_vis=2000,            
-            out_path=os.path.join(
-                os.path.dirname(DB_PATH),
-                "matches",
-                f"matches_{fname}"
-            )
+            mask=mask,
+            max_vis=2000,
+            out_path=out_path
         )
-    
+
+
+        
 if __name__ == "__main__":
     main()
