@@ -8,3 +8,5 @@
 stock_videos/
 logs*
 temp_*
+/mnt/data1/michelle/t_alltracker/Database/alltracker.db
+/mnt/data1/michelle/t_alltracker/testing2/testing.db
