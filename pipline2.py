@@ -28,12 +28,12 @@ from Database.Db import COLMAPDatabase
 
 #---------------------------DIRECTORIES-------------------------
 RAW_IMG_DIR = "test_sin"
-MASK_ALL_DIR = "./All_t/all_fmap"
-ALLT_IMG_DIR = "./All_t/masked"
-DB_PATH = "./Database/alltracker.db"
-ORB_IMG_DIR = "./Database/vis"
+MASK_ALL_DIR = "./testing2/all_fmap"
+ALLT_IMG_DIR = "./testing2/masked"
+DB_PATH = "./testing2/testing.db"
+ORB_IMG_DIR = "./testing2/vis"
 MASK_PATH = "/mnt/data1/michelle/t_alltracker/All_t/undistorted_mask.bmp"
-PCA_DIR = "./Database/pca"
+PCA_DIR = "./testing2/pca"
 os.makedirs(PCA_DIR, exist_ok=True)
 
 
@@ -122,12 +122,14 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
                 mask_r_dict[filename] = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
             else:
                 mask_r_dict[filename] = mask
+
     for filename in filenames:
         img_path = os.path.join(input_dir, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             print(f"[ORB Track]: Could not read {filename}, skipping")
             continue
+
         # resize
         H0, W0 = img.shape[:2]
         scale = min(image_size / H0, image_size / W0)
@@ -137,6 +139,7 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
 
         kps_all, desc_all = results[filename]
         kps_all = np.array(kps_all, dtype=np.float32)
+
         # Filter keypoints using mask
         if mask is not None:
             mask_r = mask_r_dict[filename]
@@ -146,7 +149,8 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
             ]
             kps_all = kps_all[keep]
             desc_all = desc_all[keep]
-        # convert to cv2 keypoints
+
+        # convert to cv2 KeyPoints
         kps_cv2 = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kps_all] if len(kps_all) else []
 
         # subsample
@@ -164,6 +168,7 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
                     desc_refined = desc_refined.reshape(1, -1)
         else:
             kps_refined, desc_refined = [], np.zeros((0, 32), dtype=np.uint8)
+
         # scale back to original image size
         if kps_refined:
             pts_orig = np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32)
@@ -275,10 +280,7 @@ def pca_visualization(db_path, filenames, pca_out_dir):
 
         # DEBUG: print first 5 descriptors to check values
         # print(f"[DEBUG] {fname}: first 5 descriptors (rows x cols = {desc.shape}):")
-        # # first 5 
-        # print(desc[:10])
-        # # last 5
-        # #print(desc[-5:])
+        # print(desc[:5])
         
         if np.var(desc) == 0:
             print(f"[PCA] Skipping {fname}, constant descriptors")
@@ -319,7 +321,7 @@ def pca_visualization(db_path, filenames, pca_out_dir):
         plt.close()
         print(f"[PCA] Saved visualization to {out_path}")
 
-#------------------------FEATURE CORRESPONDANCE------------------------
+#------------------------FEATURE CORRESPONDANCE#------------------------
 # feature correspondance between images from database
 def f_matches(
     img0_path,
