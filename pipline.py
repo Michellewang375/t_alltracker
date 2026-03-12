@@ -204,6 +204,8 @@ def save_to_db(db_path, results):
     db.close()
     print("[DB] Saved keypoints and descriptors")
 
+
+
 #-------------------------VISUALIZE KEYPOINTS--------------------------
 # visualzing keypoints in database 
 def key_visualize(db_path, img_dir, out_dir, image_size=1024):
@@ -292,7 +294,6 @@ def pca_visualization(db_path, filenames, pca_out_dir):
             continue
         kp_rows, kp_cols, kp_blob = row_kp
         kps = np.frombuffer(kp_blob, dtype=np.float32).reshape(kp_rows, kp_cols)
-
         #running PCA vis
         pca = PCA(n_components=3)
         projected = pca.fit_transform(desc_f)  # shape: (num_kps, 3)
@@ -305,12 +306,25 @@ def pca_visualization(db_path, filenames, pca_out_dir):
         # square size
         square_size = 5
         half = square_size // 2
+        # load mask and erode
+        mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print("[PCA] Mask not found, skipping mask application")
+            mask = np.ones((H_img, W_img), dtype=np.uint8)
+        else:
+            mask = (mask > 0).astype(np.uint8)
+            kernel = np.ones((5,5), np.uint8) #erosion
+            mask = cv2.erode(mask, kernel, iterations=10)
+            if mask.shape != (H_img, W_img):
+                mask = cv2.resize(mask, (W_img, H_img), interpolation=cv2.INTER_NEAREST)
+        #loop for visualization
         for i in range(kps.shape[0]):
             x, y = int(round(kps[i, 0])), int(round(kps[i, 1]))
+            if mask[y, x] == 0:
+                continue
             x0, x1 = max(x - half, 0), min(x + half + 1, W_img)
             y0, y1 = max(y - half, 0), min(y + half + 1, H_img)
             viz[y0:y1, x0:x1, :] = colors[i]
-
         plt.figure(figsize=(12, 8))
         plt.imshow(viz)
         plt.axis('off')
@@ -567,6 +581,10 @@ def main():
         print("[WARN] Mask not found, skipping image masking")
     else:
         mask = (mask > 0).astype(np.uint8)
+
+        # ---- ERODE MASK ----
+        kernel = np.ones((5,5), np.uint8)   # adjust size if needed
+        mask = cv2.erode(mask, kernel, iterations=1)
         for fname in results.keys():
             in_path = os.path.join(MASK_ALL_DIR, fname)
             out_path = os.path.join(ALLT_IMG_DIR, fname)
@@ -592,6 +610,8 @@ def main():
     mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
     if mask is not None:
         mask = (mask > 0).astype(np.uint8)
+        kernel = np.ones((5,5), np.uint8) #erosion
+        mask = cv2.erode(mask, kernel, iterations=1)
     else:
         print("[WARN] Mask not found, skipping masking")
     orb_results = orb_track(results, ALLT_IMG_DIR, mask=mask, max_kp=5000)
@@ -627,6 +647,8 @@ def main():
         mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
         if mask is not None:
             mask = (mask > 0).astype(np.uint8)
+            kernel = np.ones((5,5), np.uint8) #erosion
+            mask = cv2.erode(mask, kernel, iterations=1)
         else:
             print("[WARN] Mask not found or invalid")
     frame_names = sorted(results.keys())

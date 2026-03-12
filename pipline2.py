@@ -39,6 +39,7 @@ os.makedirs(PCA_DIR, exist_ok=True)
 
 
 
+
 #---------------------------ALLTRACKER-----------------------------
 #import desired tracking algo --> using alltracker
 def run_alltracker(model, input_dir, args):
@@ -122,14 +123,12 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
                 mask_r_dict[filename] = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
             else:
                 mask_r_dict[filename] = mask
-
     for filename in filenames:
         img_path = os.path.join(input_dir, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             print(f"[ORB Track]: Could not read {filename}, skipping")
             continue
-
         # resize
         H0, W0 = img.shape[:2]
         scale = min(image_size / H0, image_size / W0)
@@ -139,7 +138,6 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
 
         kps_all, desc_all = results[filename]
         kps_all = np.array(kps_all, dtype=np.float32)
-
         # Filter keypoints using mask
         if mask is not None:
             mask_r = mask_r_dict[filename]
@@ -149,8 +147,7 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
             ]
             kps_all = kps_all[keep]
             desc_all = desc_all[keep]
-
-        # convert to cv2 KeyPoints
+        # convert to cv2 keypoints
         kps_cv2 = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kps_all] if len(kps_all) else []
 
         # subsample
@@ -168,7 +165,6 @@ def orb_track(results, input_dir, mask=None, max_kp=5000, image_size=1024):
                     desc_refined = desc_refined.reshape(1, -1)
         else:
             kps_refined, desc_refined = [], np.zeros((0, 32), dtype=np.uint8)
-
         # scale back to original image size
         if kps_refined:
             pts_orig = np.array([[kp.pt[0], kp.pt[1]] for kp in kps_refined], dtype=np.float32)
@@ -280,7 +276,10 @@ def pca_visualization(db_path, filenames, pca_out_dir):
 
         # DEBUG: print first 5 descriptors to check values
         # print(f"[DEBUG] {fname}: first 5 descriptors (rows x cols = {desc.shape}):")
-        # print(desc[:5])
+        # # first 5 
+        # print(desc[:10])
+        # # last 5
+        # #print(desc[-5:])
         
         if np.var(desc) == 0:
             print(f"[PCA] Skipping {fname}, constant descriptors")
@@ -294,7 +293,6 @@ def pca_visualization(db_path, filenames, pca_out_dir):
             continue
         kp_rows, kp_cols, kp_blob = row_kp
         kps = np.frombuffer(kp_blob, dtype=np.float32).reshape(kp_rows, kp_cols)
-
         #running PCA vis
         pca = PCA(n_components=3)
         projected = pca.fit_transform(desc_f)  # shape: (num_kps, 3)
@@ -307,12 +305,25 @@ def pca_visualization(db_path, filenames, pca_out_dir):
         # square size
         square_size = 5
         half = square_size // 2
+        # load mask and erode
+        mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print("[PCA] Mask not found, skipping mask application")
+            mask = np.ones((H_img, W_img), dtype=np.uint8)
+        else:
+            mask = (mask > 0).astype(np.uint8)
+            kernel = np.ones((5,5), np.uint8) #erosion
+            mask = cv2.erode(mask, kernel, iterations=10)
+            if mask.shape != (H_img, W_img):
+                mask = cv2.resize(mask, (W_img, H_img), interpolation=cv2.INTER_NEAREST)
+        #loop for visualization
         for i in range(kps.shape[0]):
             x, y = int(round(kps[i, 0])), int(round(kps[i, 1]))
+            if mask[y, x] == 0:
+                continue
             x0, x1 = max(x - half, 0), min(x + half + 1, W_img)
             y0, y1 = max(y - half, 0), min(y + half + 1, H_img)
             viz[y0:y1, x0:x1, :] = colors[i]
-
         plt.figure(figsize=(12, 8))
         plt.imshow(viz)
         plt.axis('off')
@@ -321,7 +332,7 @@ def pca_visualization(db_path, filenames, pca_out_dir):
         plt.close()
         print(f"[PCA] Saved visualization to {out_path}")
 
-#------------------------FEATURE CORRESPONDANCE#------------------------
+#------------------------FEATURE CORRESPONDANCE------------------------
 # feature correspondance between images from database
 def f_matches(
     img0_path,
@@ -569,6 +580,10 @@ def main():
         print("[WARN] Mask not found, skipping image masking")
     else:
         mask = (mask > 0).astype(np.uint8)
+
+        # ---- ERODE MASK ----
+        kernel = np.ones((5,5), np.uint8)   # adjust size if needed
+        mask = cv2.erode(mask, kernel, iterations=1)
         for fname in results.keys():
             in_path = os.path.join(MASK_ALL_DIR, fname)
             out_path = os.path.join(ALLT_IMG_DIR, fname)
@@ -594,6 +609,8 @@ def main():
     mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
     if mask is not None:
         mask = (mask > 0).astype(np.uint8)
+        kernel = np.ones((5,5), np.uint8) #erosion
+        mask = cv2.erode(mask, kernel, iterations=1)
     else:
         print("[WARN] Mask not found, skipping masking")
     orb_results = orb_track(results, ALLT_IMG_DIR, mask=mask, max_kp=5000)
@@ -629,6 +646,8 @@ def main():
         mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
         if mask is not None:
             mask = (mask > 0).astype(np.uint8)
+            kernel = np.ones((5,5), np.uint8) #erosion
+            mask = cv2.erode(mask, kernel, iterations=1)
         else:
             print("[WARN] Mask not found or invalid")
     frame_names = sorted(results.keys())
