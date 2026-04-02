@@ -1,6 +1,7 @@
 # how to run:
 #1. conda activate alltracker
 #2. python pipline.py
+#index 0-9
 
 #---------------------------IMPORTS------------------------------
 import os
@@ -23,61 +24,117 @@ sys.path.append(os.path.abspath("./all_t_git"))
 from nets.alltracker import Net
 from demo import read_image_folder
 # Import database module
-from Database.Db import COLMAPDatabase
+from p02_left_preop_scope01.Database.Db import COLMAPDatabase
 
 
 #---------------------------DIRECTORIES-------------------------
-RAW_IMG_DIR = "test_sin"
-MASK_ALL_DIR = "./testing2/all_fmap"
-ALLT_IMG_DIR = "./testing2/masked"
-DB_PATH = "./testing2/testing.db"
-ORB_IMG_DIR = "./testing2/vis"
+RAW_IMG_DIR = "./p01_left_preop_scope01/raw_input_sinus"
+MASK_ALL_DIR = "./p01_left_preop_scope01/window2/fmap2"
+ALLT_IMG_DIR = "./p01_left_preop_scope01/window2/masked2"
+DB_PATH = "./p01_left_preop_scope01/window2/db2.db"
+ORB_IMG_DIR = "./Database/vis"
 MASK_PATH = "/mnt/data1/michelle/t_alltracker/All_t/undistorted_mask.bmp"
-PCA_DIR = "./testing2/pca"
+PCA_DIR = "./Database/pca"
 os.makedirs(PCA_DIR, exist_ok=True)
-
 
 
 
 
 #---------------------------ALLTRACKER-----------------------------
 #import desired tracking algo --> using alltracker
-def run_alltracker(model, input_dir, args):
-    rgbs, framerate = read_image_folder(
-        input_dir, image_size=args.image_size, max_frames=args.max_frames
-    )
-    if len(rgbs) == 0:
-        print("[AllTracker] No images found in", input_dir)
-        return {}, {}
-    # Move to GPU and eval
+# def run_alltracker(model, input_dir, args, start_idx=0):
+#     # rgbs, framerate = read_image_folder(
+#     #     input_dir, image_size=args.image_size, max_frames=args.max_frames
+#     # )
+#     if len(rgbs) == 0:
+#         print("[AllTracker] No images found in", input_dir)
+#         return {}, {}
+#     # Move to GPU and eval
+#     rgbs = rgbs.cuda()
+#     for n, p in model.named_parameters():
+#         p.requires_grad = False
+#     model.eval()
+#     # Forward through AllTracker (same as demo)
+#     print("[AllTracker] Running forward pass")
+#     with torch.no_grad():
+#         traj_maps, vis_maps, *_ = model.forward_sliding(
+#             rgbs, iters=args.inference_iters, window_len=args.window_len
+#         )
+#     # Convert outputs
+#     traj_maps = traj_maps[0].cpu().numpy()   # (T, 2, H, W)
+#     vis_maps  = vis_maps[0].cpu().numpy()    # (T, 1, H, W)
+#     T, _, H, W = traj_maps.shape
+#     xs, ys = np.meshgrid(np.arange(W), np.arange(H))
+#     base_pts = np.stack([xs.flatten(), ys.flatten()], axis=-1).astype(np.float32)  # (H*W, 2)
+#     results = {}
+#     correspondences = {}
+
+#     for t in range(T):
+#         flow = traj_maps[t]        # (2, H, W)
+#         conf = vis_maps[t, 0]      # (H, W)
+#         mask = conf > args.conf_thr
+
+#         # keypoints in frame t (x,y)
+#         ft_xy = np.stack([xs[mask], ys[mask]], axis=1).astype(np.float32)
+
+#         # corresponding coordinates
+#         flow_x = flow[0]
+#         flow_y = flow[1]
+#         f0_xy = np.stack([
+#             xs[mask] - flow_x[mask],
+#             ys[mask] - flow_y[mask]
+#         ], axis=1).astype(np.float32)
+
+#         # indices into flattened base_pts
+#         idx0 = np.flatnonzero(mask.flatten()).astype(np.uint32)
+#         idxt = np.arange(len(ft_xy), dtype=np.uint32)
+
+#         # Save keypoints (descriptors r empty)
+#         fname = f"frame_{t + start_idx:04d}.png"
+#         results[fname] = (ft_xy, np.zeros((len(ft_xy), 32), dtype=np.uint8))
+
+#         # Save correspondence
+#         correspondences[t] = {
+#             "idx0": idx0,
+#             "idxt": idxt,
+#             "f0_xy": f0_xy,
+#             "ft_xy": ft_xy,
+#             "mask": mask  # keep 2D
+#         }
+#     print(f"[AllTracker] finished.")
+#     return results, correspondences
+def run_alltracker(model, rgbs, args, start_idx=0):
+
+    # rgbs already passed in
     rgbs = rgbs.cuda()
+
     for n, p in model.named_parameters():
         p.requires_grad = False
     model.eval()
-    # Forward through AllTracker (same as demo)
+
     print("[AllTracker] Running forward pass")
+
     with torch.no_grad():
         traj_maps, vis_maps, *_ = model.forward_sliding(
             rgbs, iters=args.inference_iters, window_len=args.window_len
         )
-    # Convert outputs
-    traj_maps = traj_maps[0].cpu().numpy()   # (T, 2, H, W)
-    vis_maps  = vis_maps[0].cpu().numpy()    # (T, 1, H, W)
+
+    traj_maps = traj_maps[0].cpu().numpy()
+    vis_maps  = vis_maps[0].cpu().numpy()
+
     T, _, H, W = traj_maps.shape
     xs, ys = np.meshgrid(np.arange(W), np.arange(H))
-    base_pts = np.stack([xs.flatten(), ys.flatten()], axis=-1).astype(np.float32)  # (H*W, 2)
+
     results = {}
     correspondences = {}
 
     for t in range(T):
-        flow = traj_maps[t]        # (2, H, W)
-        conf = vis_maps[t, 0]      # (H, W)
+        flow = traj_maps[t]
+        conf = vis_maps[t, 0]
         mask = conf > args.conf_thr
 
-        # keypoints in frame t (x,y)
         ft_xy = np.stack([xs[mask], ys[mask]], axis=1).astype(np.float32)
 
-        # corresponding coordinates
         flow_x = flow[0]
         flow_y = flow[1]
         f0_xy = np.stack([
@@ -85,24 +142,24 @@ def run_alltracker(model, input_dir, args):
             ys[mask] - flow_y[mask]
         ], axis=1).astype(np.float32)
 
-        # indices into flattened base_pts
         idx0 = np.flatnonzero(mask.flatten()).astype(np.uint32)
         idxt = np.arange(len(ft_xy), dtype=np.uint32)
 
-        # Save keypoints (descriptors r empty)
-        fname = f"frame_{t:04d}.png"
+        fname = f"frame_{t + start_idx:04d}.png"
         results[fname] = (ft_xy, np.zeros((len(ft_xy), 32), dtype=np.uint8))
 
-        # Save correspondence
         correspondences[t] = {
             "idx0": idx0,
             "idxt": idxt,
             "f0_xy": f0_xy,
             "ft_xy": ft_xy,
-            "mask": mask  # keep 2D
+            "mask": mask
         }
-    print(f"[AllTracker] finished.")
+
+    print("[AllTracker] finished.")
     return results, correspondences
+
+
 
 #---------------------------ORB TRACKING------------------------------
 #Use ORB to refine and track keypoints and descriptors between consecutive frames
@@ -342,8 +399,7 @@ def f_matches(
     matches,
     mask=None,
     max_vis=2000,
-    out_path="vis_matches.png"
-):
+    out_path="vis_matches.png" ):
     # img loading
     img0 = cv2.imread(img0_path)
     img1 = cv2.imread(img1_path)
@@ -389,11 +445,7 @@ def f_matches(
     cv2.imwrite(out_path, canvas)
     print(f"[VIS] Saved {out_path}")
 
-
-
-
 #------------------------HELPER FUNCTIONS------------------------
-
 #resizing img for alltracker, same as alltracker's read_img_folder
 def img_resize(img, image_size=1024):
     import cv2
@@ -570,8 +622,30 @@ def main():
 
  # 1. Running Alltracker and apply masking
     print("\n1. Running AllTracker")
-    alltracker_results_and_corr = run_alltracker(model, RAW_IMG_DIR, args)
-    results, correspondences = alltracker_results_and_corr
+    chunk_size = 10  # deals with CUDA
+    all_results = {}
+    all_correspondences = {}
+    # load all frames first
+    rgbs, framerate = read_image_folder(
+        RAW_IMG_DIR, image_size=args.image_size, max_frames=args.max_frames
+    )
+    T = rgbs.shape[1]
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        print(f"[AllTracker] Processing frames {start} to {end-1}")
+        rgbs_chunk = rgbs[:, start:end].cuda() #reset CUDA memory
+        torch.cuda.empty_cache()  
+        results_chunk, corr_chunk = run_alltracker(model, rgbs_chunk, args, start_idx=start+400)
+        # merge results
+        all_results.update(results_chunk)
+        for k, v in corr_chunk.items():
+            all_correspondences[start + k] = v
+        # free memory
+        del rgbs_chunk
+        torch.cuda.empty_cache()
+    results = all_results
+    correspondences = all_correspondences
+    
     #masking
     os.makedirs(ALLT_IMG_DIR, exist_ok=True)
     # load mask
@@ -615,69 +689,73 @@ def main():
         print("[WARN] Mask not found, skipping masking")
     orb_results = orb_track(results, ALLT_IMG_DIR, mask=mask, max_kp=5000)
     #visualize
-    vis_dir = os.path.join(os.path.dirname(DB_PATH), "vis")
-    os.makedirs(vis_dir, exist_ok=True)
-    for fname, (kps, _) in orb_results.items():
-        out_path = os.path.join(vis_dir, f"vis_{fname}")
-        visualize_keypoints(
-            img_path=os.path.join(ALLT_IMG_DIR, fname),
-            kps=kps,
-            mask=mask,
-            out_path=out_path,
-            show=True
-        )
+    # vis_dir = os.path.join(os.path.dirname(DB_PATH), "vis")
+    # os.makedirs(vis_dir, exist_ok=True)
+    # for fname, (kps, _) in orb_results.items():
+    #     out_path = os.path.join(vis_dir, f"vis_{fname}")
+    #     visualize_keypoints(
+    #         img_path=os.path.join(ALLT_IMG_DIR, fname),
+    #         kps=kps,
+    #         mask=mask,
+    #         out_path=out_path,
+    #         show=True
+    #     )
         
 # 3. Saving to database
     print("\n3. Saving to database")
     save_to_db(DB_PATH, orb_results)
 
-# 4. Visualize feature descirptor using PCA
-    print("\n4. Feature Desc w/ PCA")
-    pca_visualization(DB_PATH, list(orb_results.keys()), PCA_DIR)
+# # 4. Visualize feature descirptor using PCA
+#     print("\n4. Feature Desc w/ PCA")
+#     pca_visualization(DB_PATH, list(orb_results.keys()), PCA_DIR)
 
-# 5. feature correspondance with masking
-    print("\n5. Visualizing feature correspondences with masking")
-    results, correspondences = alltracker_results_and_corr
-    matches_dir = os.path.join(os.path.dirname(DB_PATH), "matches")
-    os.makedirs(matches_dir, exist_ok=True)
-    # loading mask
-    mask = None
-    if MASK_PATH is not None and os.path.exists(MASK_PATH):
-        mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
-        if mask is not None:
-            mask = (mask > 0).astype(np.uint8)
-            kernel = np.ones((5,5), np.uint8) #erosion
-            mask = cv2.erode(mask, kernel, iterations=1)
-        else:
-            print("[WARN] Mask not found or invalid")
-    frame_names = sorted(results.keys())
-    for i in range(len(frame_names) - 1):
-        fname0 = frame_names[i]
-        fname1 = frame_names[i + 1]
-        kps0, _ = results[fname0]
-        kps1, _ = results[fname1]
-        # build matches
-        corr = correspondences.get(i+1, None)
-        if corr is None:
-            continue
-        matches = np.stack([corr["idx0"], corr["idxt"]], axis=1).astype(np.int32)
-        # only valid matches
-        valid = (matches[:,0] < len(kps0)) & (matches[:,1] < len(kps1))
-        matches = matches[valid]
+# # 5. feature correspondance with masking
+#     print("\n5. Visualizing feature correspondences with masking")
+#     results, correspondences = alltracker_results_and_corr
+#     matches_dir = os.path.join(os.path.dirname(DB_PATH), "matches")
+#     os.makedirs(matches_dir, exist_ok=True)
+#     # loading mask
+#     mask = None
+#     if MASK_PATH is not None and os.path.exists(MASK_PATH):
+#         mask = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
+#         if mask is not None:
+#             mask = (mask > 0).astype(np.uint8)
+#             kernel = np.ones((5,5), np.uint8) #erosion
+#             mask = cv2.erode(mask, kernel, iterations=1)
+#         else:
+#             print("[WARN] Mask not found or invalid")
+#     frame_names = sorted(results.keys())
+#     for i in range(len(frame_names) - 1):
+#         fname0 = frame_names[i]
+#         fname1 = frame_names[i + 1]
+#         kps0, _ = results[fname0]
+#         kps1, _ = results[fname1]
+#         # build matches
+#         corr = correspondences.get(i+1, None)
+#         if corr is None:
+#             continue
+#         matches = np.stack([corr["idx0"], corr["idxt"]], axis=1).astype(np.int32)
+#         # only valid matches
+#         valid = (matches[:,0] < len(kps0)) & (matches[:,1] < len(kps1))
+#         matches = matches[valid]
         
-        img0_path = os.path.join(ORB_IMG_DIR, f"vis_{fname0}")
-        img1_path = os.path.join(ORB_IMG_DIR, f"vis_{fname1}")
-        out_path = os.path.join(matches_dir, f"all_match_{i:04d}.png")
+#         img0_path = os.path.join(ORB_IMG_DIR, f"vis_{fname0}")
+#         img1_path = os.path.join(ORB_IMG_DIR, f"vis_{fname1}")
+#         out_path = os.path.join(matches_dir, f"all_match_{i:04d}.png")
 
-        f_matches(
-            img0_path=img0_path,
-            img1_path=img1_path,
-            kps0=kps0,
-            kps1=kps1,
-            matches=matches,
-            mask=mask,
-            max_vis=2000,
-            out_path=out_path
-        )   
+#         f_matches(
+#             img0_path=img0_path,
+#             img1_path=img1_path,
+#             kps0=kps0,
+#             kps1=kps1,
+#             matches=matches,
+#             mask=mask,
+#             max_vis=2000,
+#             out_path=out_path
+#         )   
+
+
+
+
 if __name__ == "__main__":
     main()
