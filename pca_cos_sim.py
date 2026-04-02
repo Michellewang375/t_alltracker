@@ -5,12 +5,14 @@ import sqlite3
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import random
+import csv
 
 # --------------------------- CONFIG ------------------------------
 RGB_DIR   = "./p01_left_preop_scope01/window1/masked1"
 DB_PATH_1 = "./p01_left_preop_scope01/window1/alltracker.db"
 DB_PATH_2 = "./p01_left_preop_scope01/window2/db2.db"
 OUT_DIR   = "./p01_left_preop_scope01/comparison_results"
+sequence_name = "p01_left_preop_scope01"
 
 N_COMPARE = 5
 TOP_K = 50
@@ -108,6 +110,30 @@ def plot_cosine_similarity(frame_indices, scores, out_path):
     plt.close()
     print(f"[GRAPH] Saved {out_path}")
 
+# --------------------------- SAVE TO CSV ------------------------------
+def save_to_csv(cos_values, out_path, sequence_name):
+    if len(cos_values) == 0:
+        print("[CSV] No cosine values to save.")
+        return
+    cos_values = np.array(cos_values)
+    stats = {
+        "sequence": sequence_name,
+        "min": np.min(cos_values),
+        "max": np.max(cos_values),
+        "mean": np.mean(cos_values),
+        "std": np.std(cos_values),
+        "median": np.median(cos_values),
+    }
+    # Check if file exists 
+    file_exists = os.path.isfile(out_path)
+    with open(out_path, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        # write header only once
+        if not file_exists:
+            writer.writerow(stats.keys())
+        writer.writerow(stats.values())
+    print(f"[CSV] Appended stats to {out_path}")
+    
 # --------------------------- MAIN ------------------------------
 def main():
     conn1 = sqlite3.connect(DB_PATH_1)
@@ -121,10 +147,9 @@ def main():
     cursor2.execute("SELECT image_id FROM images ORDER BY image_id")
     ids2 = [row[0] for row in cursor2.fetchall()]
 
-    num_pairs = min(len(ids1), len(ids2) - OFFSET)
-
-    ids1_sel = ids1[:num_pairs]
-    ids2_sel = ids2[OFFSET:OFFSET + num_pairs]
+    num_pairs = min(len(ids1)-OFFSET, len(ids2))
+    ids1_sel = ids1[OFFSET:OFFSET+num_pairs]
+    ids2_sel = ids2[:num_pairs]
 
     # load mask
     mask_global = cv2.imread(MASK_PATH, cv2.IMREAD_GRAYSCALE)
@@ -136,6 +161,7 @@ def main():
 
     scores = []
     frame_indices = []
+    all_cos_values = []
 
     for idx, (frame_id_1, frame_id_2) in enumerate(zip(ids1_sel, ids2_sel)):
 
@@ -165,6 +191,7 @@ def main():
         # APPEND TO ALL SCORES
         scores.append(mean_cos)
         frame_indices.append(idx)
+        all_cos_values.extend(cos.tolist())
 
         print(f"Frame {frame_id_1} vs {frame_id_2}: mean={mean_cos:.6f}, min={min_cos:.6f}, max={max_cos:.6f}")
 
@@ -204,15 +231,17 @@ def main():
             cv2.imwrite(out_path_ext, combined_ext)
             print(f"[EXTREMES] Saved {out_path_ext}")
 
-    # AFTER LOOP: PLOT GRAPH FOR ALL FRAMES
-    if scores:
+    # plot cosine graph and save to csv
+    if scores and len(all_cos_values) > 0:
         graph_path = os.path.join(OUT_DIR, "cosine_similarity_over_time.png")
         plot_cosine_similarity(frame_indices, scores, graph_path)
-        final_mean_cos = np.mean(scores)
-        print("\n----------------------------------")
-        print(f"FINAL MEAN COSINE SIMILARITY ACROSS ALL FRAMES: {final_mean_cos:.6f}")
+        # Save CSV stats
+        save_to_csv(all_cos_values, "./stats.csv", sequence_name)
+
     else:
         print("No valid comparisons.")
+            
+        
         
 
     conn1.close()
